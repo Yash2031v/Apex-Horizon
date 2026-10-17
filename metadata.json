@@ -1,0 +1,6 @@
+{
+  "name": "Apex Velocity GT",
+  "description": "High-speed 3D Grand Touring car racing simulator with procedural composite hypercars, dynamic track environments, AI rivals, drift physics, and real-time telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
