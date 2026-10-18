@@ -12,12 +12,16 @@ import {
   Compass,
   Camera,
   Keyboard,
+  Crosshair,
+  ShieldAlert,
+  Flame,
   X,
 } from 'lucide-react';
 import {
   CameraMode,
   CAR_LIVERIES,
   CarLivery,
+  CombatDifficulty,
   RaceStatus,
   RaceTelemetry,
   TRACK_CONFIGS,
@@ -48,8 +52,11 @@ const INITIAL_TELEMETRY: RaceTelemetry = {
   nitro: 100,
   isBoosting: false,
   isDrifting: false,
+  isTyreScrubbing: false,
+  isSliding: false,
   isSlipstreaming: false,
   isOffTrack: false,
+  scoreEventLabel: null,
   lap: 1,
   totalLaps: 3,
   position: 1,
@@ -61,6 +68,24 @@ const INITIAL_TELEMETRY: RaceTelemetry = {
   driftScore: 0,
   currentDriftPoints: 0,
   lapProgress: 0,
+  combatMode: true,
+  combatDifficulty: 'normal',
+  permanentElimination: false,
+  activeRivalsCount: 5,
+  playerHp: 100,
+  playerMaxHp: 100,
+  isPlayerDestroyed: false,
+  playerRespawnTimer: 0,
+  isPlayerInvulnerable: false,
+  mgHeat: 0,
+  mgOverheated: false,
+  missileAmmo: 6,
+  missileMaxAmmo: 6,
+  missileCooldown: 0,
+  kills: 0,
+  killFeed: [],
+  crosshairScreen: { x: 50, y: 48, visible: false, hasLock: false },
+  rivalOverlays: [],
   standings: [],
 };
 
@@ -69,12 +94,18 @@ export default function App() {
   const [livery, setLivery] = useState<CarLivery>(CAR_LIVERIES[0]);
   const [cameraMode, setCameraMode] = useState<CameraMode>('chase');
   const [raceStatus, setRaceStatus] = useState<RaceStatus>('ready');
+  const [combatMode, setCombatMode] = useState<boolean>(true);
+  const [combatDifficulty, setCombatDifficulty] =
+    useState<CombatDifficulty>('normal');
+  const [permanentElimination, setPermanentElimination] =
+    useState<boolean>(false);
   const [totalLaps, setTotalLaps] = useState<number>(3);
   const [resetSignal, setResetSignal] = useState<number>(0);
   const [telemetry, setTelemetry] = useState<RaceTelemetry>(INITIAL_TELEMETRY);
 
   const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [masterVolume, setMasterVolume] = useState<number>(0.75);
   const [activeModal, setActiveModal] = useState<
     'standings' | 'controls' | null
   >(null);
@@ -85,6 +116,8 @@ export default function App() {
     left: false,
     right: false,
     nitro: false,
+    fireMg: false,
+    fireMissile: false,
   });
 
   const handleStartOrToggleRace = useCallback(() => {
@@ -110,10 +143,26 @@ export default function App() {
 
   const handleToggleMute = useCallback(() => {
     soundEngine.init();
-    const next = !isMuted;
-    setIsMuted(next);
-    soundEngine.setMuted(next);
-  }, [isMuted]);
+    setIsMuted((prev) => {
+      const next = !prev;
+      soundEngine.setMuted(next);
+      return next;
+    });
+  }, []);
+
+  const handleVolumeChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      soundEngine.init();
+      const val = parseFloat(e.target.value);
+      setMasterVolume(val);
+      soundEngine.setMasterVolume(val);
+      if (val > 0 && isMuted) {
+        setIsMuted(false);
+        soundEngine.setMuted(false);
+      }
+    },
+    [isMuted]
+  );
 
   const handleCycleTrack = useCallback(() => {
     const order: TrackTheme[] = ['canyon', 'midnight', 'alpine'];
@@ -121,11 +170,13 @@ export default function App() {
     setTrackTheme(order[nextIdx]);
   }, [trackTheme]);
 
-  // Global keyboard shortcuts for HUD dock collapse (H), Camera cycle (C), Pause (P / Escape)
+  // Global keyboard shortcuts for HUD dock collapse (H), Mute (M), Camera cycle (C), Pause (P / Escape)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'KeyH') {
         setIsDockCollapsed((prev) => !prev);
+      } else if (e.code === 'KeyM') {
+        handleToggleMute();
       } else if (e.code === 'KeyC') {
         setCameraMode((prev) =>
           prev === 'chase' ? 'hood' : prev === 'hood' ? 'aerial' : 'chase'
@@ -144,7 +195,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [raceStatus]);
+  }, [raceStatus, handleToggleMute]);
 
   const setTouchInput = (key: keyof TouchDriveControls, value: boolean) => {
     soundEngine.init();
@@ -157,6 +208,10 @@ export default function App() {
   const currentTrackConfig = TRACK_CONFIGS[trackTheme];
   const rpmRatio = Math.min(1, Math.max(0, (telemetry.rpm - 1000) / 8000));
   const isRedline = telemetry.rpm >= 7800;
+  const playerHpRatio = Math.max(
+    0,
+    Math.min(1, telemetry.playerHp / Math.max(1, telemetry.playerMaxHp))
+  );
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#080A0F] text-[#F8FAFC] flex flex-col">
@@ -174,7 +229,7 @@ export default function App() {
           Apex Horizon
         </a>
 
-        {/* Zone 2: 4 concise single-line text navigation links */}
+        {/* Zone 2: 4 concise single-line text navigation links (including Combat Mode Toggle) */}
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-300">
           <button
             type="button"
@@ -182,6 +237,15 @@ export default function App() {
             className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             Switch Circuit
+          </button>
+          <button
+            type="button"
+            onClick={() => setCombatMode((prev) => !prev)}
+            className={`hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              combatMode ? 'text-rose-400 font-semibold' : 'hover:text-white'
+            }`}
+          >
+            Combat Mode: {combatMode ? 'ON' : 'OFF'}
           </button>
           <button
             type="button"
@@ -204,13 +268,6 @@ export default function App() {
             className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             Driving Controls
-          </button>
-          <button
-            type="button"
-            onClick={handleResetRace}
-            className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            Reset Grid
           </button>
         </nav>
 
@@ -241,12 +298,277 @@ export default function App() {
           livery={livery}
           cameraMode={cameraMode}
           raceStatus={raceStatus}
+          combatMode={combatMode}
+          combatDifficulty={combatDifficulty}
+          permanentElimination={permanentElimination}
           totalLaps={totalLaps}
           resetSignal={resetSignal}
           touchControlsRef={touchControlsRef}
           onTelemetryUpdate={setTelemetry}
           onStatusChange={setRaceStatus}
         />
+
+        {/* 2D SCREEN-PROJECTED TARGETING CROSSHAIR & RIVAL TARGET BOXES / HEALTH BARS */}
+        {combatMode && raceStatus === 'racing' && (
+          <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
+            {/* Small Crosshair Ahead of the Car */}
+            {telemetry.crosshairScreen.visible && (
+              <div
+                style={{
+                  left: `${telemetry.crosshairScreen.x}%`,
+                  top: `${telemetry.crosshairScreen.y}%`,
+                }}
+                className="absolute -translate-x-1/2 -translate-y-1/2 transition-all duration-75"
+              >
+                <div
+                  className={`w-5 h-5 rounded-full border flex items-center justify-center ${
+                    telemetry.crosshairScreen.hasLock
+                      ? 'border-rose-500 bg-rose-500/15 scale-110 shadow-[0_0_10px_rgba(244,63,94,0.65)]'
+                      : 'border-amber-300/65 bg-black/15'
+                  }`}
+                >
+                  <div
+                    className={`w-1 h-1 rounded-full ${
+                      telemetry.crosshairScreen.hasLock
+                        ? 'bg-rose-400'
+                        : 'bg-amber-300'
+                    }`}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Compact Rival Health Bars & Red Target Lock Box (100 HP max, scaled so car is unobstructed) */}
+            {telemetry.rivalOverlays.map((rv) => {
+              if (!rv.visible) return null;
+              const hpPct = Math.max(0, Math.min(100, (rv.hp / rv.maxHp) * 100));
+              const distScale = Math.max(
+                0.62,
+                Math.min(0.95, 28 / Math.max(18, rv.distanceMeters))
+              );
+              return (
+                <div
+                  key={rv.id}
+                  style={{
+                    left: `${rv.screenX}%`,
+                    top: `${rv.screenY}%`,
+                    transform: `translate(-50%, -100%) scale(${distScale.toFixed(2)})`,
+                  }}
+                  className="absolute origin-bottom flex flex-col items-center transition-all duration-75"
+                >
+                  {/* Compact Health Bar Above Each AI Car (100 HP) */}
+                  <div className="px-1 py-0.5 rounded bg-[#090D16]/80 border border-white/15 flex flex-col items-center gap-0.5 shadow-sm">
+                    <div className="flex items-center gap-1 text-[8px] font-mono-tabular leading-none">
+                      <span
+                        className={
+                          rv.isLockedTarget
+                            ? 'text-rose-400 font-bold'
+                            : 'text-slate-200 font-medium'
+                        }
+                      >
+                        {rv.driverName.split(' ')[0]}
+                      </span>
+                      <span className="text-slate-300">{rv.hp}</span>
+                    </div>
+                    <div className="w-11 h-1 rounded-full bg-white/15 overflow-hidden">
+                      <div
+                        className={`h-full transition-all duration-75 ${
+                          hpPct > 50
+                            ? 'bg-emerald-400'
+                            : hpPct > 30
+                              ? 'bg-amber-400'
+                              : 'bg-rose-500'
+                        }`}
+                        style={{ width: `${hpPct}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Compact Red Target Lock Bracket when Rival is in the 8° Crosshair Cone */}
+                  {rv.isLockedTarget && (
+                    <div className="mt-0.5 w-10 h-6 border border-rose-500/90 rounded-xs shadow-[0_0_8px_rgba(244,63,94,0.55)] relative flex items-end justify-center">
+                      <span className="text-[7px] font-mono-tabular font-bold uppercase tracking-tight text-rose-200 bg-rose-950/85 px-1 rounded-xs leading-tight">
+                        {rv.distanceMeters}m
+                      </span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* TOP-LEFT COMBAT HUD PANEL & KILL FEED (Never Overlaps Top Bar or Top-Right Minimap) */}
+        {combatMode && (
+          <aside
+            aria-label="Combat Weapons and Armor Telemetry"
+            className="pointer-events-none absolute top-16 left-4 z-10 w-56 flex flex-col gap-2 select-none"
+          >
+            <div className="pointer-events-auto rounded-xl bg-[#0B0F19]/90 border border-white/15 p-2.5 shadow-xl space-y-2">
+              {/* Header: Combat Status & Kill Count */}
+              <div className="flex items-center justify-between border-b border-white/10 pb-1">
+                <span className="text-[10px] font-display font-bold uppercase tracking-wider text-rose-400 flex items-center gap-1">
+                  <Crosshair className="w-3 h-3" />
+                  Combat Systems
+                </span>
+                <span className="text-[11px] font-mono-tabular font-bold text-amber-400">
+                  Kills: {telemetry.kills}
+                </span>
+              </div>
+
+              {/* Player Hull Health Bar (100 HP) */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-[10px] font-mono-tabular">
+                  <span className="text-slate-300">Armor Integrity</span>
+                  <span
+                    className={
+                      telemetry.isPlayerDestroyed
+                        ? 'text-rose-400 font-bold'
+                        : telemetry.isPlayerInvulnerable
+                          ? 'text-cyan-300 font-bold'
+                          : telemetry.playerHp <= 30
+                            ? 'text-rose-400 font-bold'
+                            : 'text-emerald-400 font-semibold'
+                    }
+                  >
+                    {telemetry.isPlayerDestroyed
+                      ? `RESPAWN ${telemetry.playerRespawnTimer}s`
+                      : telemetry.isPlayerInvulnerable
+                        ? `SHIELDED · ${telemetry.playerHp} HP`
+                        : `${telemetry.playerHp} / ${telemetry.playerMaxHp} HP`}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-75 ${
+                      telemetry.playerHp > 50
+                        ? 'bg-emerald-400'
+                        : telemetry.playerHp > 30
+                          ? 'bg-amber-400'
+                          : 'bg-rose-500'
+                    }`}
+                    style={{ width: `${playerHpRatio * 100}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Machine Gun Heat Bar */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px] font-mono-tabular">
+                  <span className="text-slate-300 flex items-center gap-1">
+                    <Flame className="w-3 h-3 text-amber-400" />
+                    Vulcan MG (Space/LMB)
+                  </span>
+                  <span
+                    className={
+                      telemetry.mgOverheated
+                        ? 'text-rose-400 font-bold'
+                        : 'text-amber-300'
+                    }
+                  >
+                    {telemetry.mgOverheated
+                      ? 'OVERHEATED'
+                      : `${telemetry.mgHeat}% HEAT`}
+                  </span>
+                </div>
+                <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-75 ${
+                      telemetry.mgOverheated
+                        ? 'bg-rose-500'
+                        : telemetry.mgHeat > 75
+                          ? 'bg-amber-400'
+                          : 'bg-yellow-300'
+                    }`}
+                    style={{ width: `${telemetry.mgHeat}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Homing Missile Ammo Counter */}
+              <div className="pt-0.5 flex items-center justify-between text-[11px] font-mono-tabular">
+                <span className="text-slate-300">Missiles (F / RMB)</span>
+                <div className="flex items-center gap-1">
+                  {Array.from({ length: telemetry.missileMaxAmmo }).map(
+                    (_, idx) => (
+                      <span
+                        key={idx}
+                        className={`w-2 h-3.5 rounded-xs transition-colors ${
+                          idx < telemetry.missileAmmo
+                            ? 'bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.7)]'
+                            : 'bg-white/10'
+                        }`}
+                      />
+                    )
+                  )}
+                  <span className="ml-1 text-white font-bold">
+                    {telemetry.missileAmmo}/{telemetry.missileMaxAmmo}
+                  </span>
+                </div>
+              </div>
+
+              {/* AI Combat Difficulty (Easy / Normal / Hard) & Permanent Elimination Toggle */}
+              <div className="pt-2 border-t border-white/10 space-y-1.5">
+                <div className="flex items-center justify-between text-[10px] font-mono-tabular">
+                  <span className="text-slate-400">AI Difficulty</span>
+                  <div className="flex items-center gap-1">
+                    {(['easy', 'normal', 'hard'] as CombatDifficulty[]).map(
+                      (diff) => (
+                        <button
+                          key={diff}
+                          type="button"
+                          onClick={() => setCombatDifficulty(diff)}
+                          className={`px-1.5 py-0.5 rounded uppercase font-semibold cursor-pointer transition-colors ${
+                            combatDifficulty === diff
+                              ? 'bg-amber-400 text-slate-950'
+                              : 'bg-white/5 text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {diff}
+                        </button>
+                      )
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[10px] font-mono-tabular">
+                  <span className="text-slate-400">
+                    Perm. Elimination ({telemetry.activeRivalsCount}/5 Alive)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setPermanentElimination((prev) => !prev)}
+                    className={`px-2 py-0.5 rounded font-semibold cursor-pointer transition-colors ${
+                      permanentElimination
+                        ? 'bg-rose-500/30 border border-rose-400/50 text-rose-200'
+                        : 'bg-white/5 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {permanentElimination ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Kill Feed Messages ("ELIMINATED ...") */}
+            {telemetry.killFeed.length > 0 && (
+              <div className="space-y-1">
+                {telemetry.killFeed.map((item) => (
+                  <div
+                    key={item.id}
+                    className={`px-3 py-1.5 rounded-lg border text-[11px] font-mono-tabular font-semibold shadow-lg ${
+                      item.isPlayerKill
+                        ? 'bg-emerald-950/90 border-emerald-400/40 text-emerald-300'
+                        : 'bg-rose-950/90 border-rose-400/40 text-rose-300'
+                    }`}
+                  >
+                    {item.message}
+                  </div>
+                ))}
+              </div>
+            )}
+          </aside>
+        )}
 
         {/* REAL-TIME TRACK MINIMAP OVERLAY (TOP-RIGHT CORNER) */}
         <TrackMinimap
@@ -308,12 +630,34 @@ export default function App() {
             </span>
           </div>
 
-          {/* Dynamic Semantic Driving Feedback Banner (Text + Icon for Accessibility) */}
+          {/* Dynamic Semantic Driving & Combat Feedback Banner */}
           {(telemetry.isBoosting ||
             telemetry.isDrifting ||
+            telemetry.isTyreScrubbing ||
+            telemetry.isSliding ||
             telemetry.isSlipstreaming ||
-            telemetry.isOffTrack) && (
-            <div className="px-3.5 py-1 rounded bg-[#0B0F19]/90 border border-white/15 text-xs font-medium tracking-wide flex items-center gap-3">
+            telemetry.isOffTrack ||
+            telemetry.isPlayerDestroyed ||
+            Boolean(telemetry.scoreEventLabel)) && (
+            <div className="px-3.5 py-1 rounded bg-[#0B0F19]/90 border border-white/15 text-xs font-medium tracking-wide flex flex-wrap items-center justify-center gap-3">
+              {telemetry.isPlayerDestroyed && (
+                <span className="text-rose-400 font-bold flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  CAR DESTROYED — RESPAWNING IN {telemetry.playerRespawnTimer}s
+                </span>
+              )}
+              {telemetry.scoreEventLabel && (
+                <span
+                  className={`font-semibold font-mono-tabular ${
+                    telemetry.scoreEventLabel.includes('-') ||
+                    telemetry.scoreEventLabel.includes('OVERHEAT')
+                      ? 'text-rose-400'
+                      : 'text-emerald-300'
+                  }`}
+                >
+                  {telemetry.scoreEventLabel}
+                </span>
+              )}
               {telemetry.isBoosting && (
                 <span className="text-cyan-300 font-semibold">
                   Nitro Boost Active (+58 KM/H)
@@ -327,6 +671,16 @@ export default function App() {
               {telemetry.isDrifting && (
                 <span className="text-amber-300 font-semibold font-mono-tabular">
                   Apex Drift +{telemetry.currentDriftPoints} PTS
+                </span>
+              )}
+              {telemetry.isSliding && (
+                <span className="text-rose-300 font-semibold">
+                  Slide — High Slip Drag
+                </span>
+              )}
+              {!telemetry.isSliding && telemetry.isTyreScrubbing && (
+                <span className="text-amber-300 font-semibold">
+                  Tyre Scrub — Cornering Speed Bleed
                 </span>
               )}
               {telemetry.isOffTrack && (
@@ -347,13 +701,20 @@ export default function App() {
                   Starting Grid Ready · {currentTrackConfig.location}
                 </p>
                 <h1 className="font-display text-xl font-bold text-white">
-                  {livery.name} · Grid Slot P1
+                  {livery.name} · {combatMode ? 'Combat Race Mode' : 'Pure Race Mode'}
                 </h1>
                 <p className="text-xs text-slate-300">
-                  Use <strong className="text-white">W/A/S/D</strong> or{' '}
-                  <strong className="text-white">Arrow Keys</strong> to steer,{' '}
-                  <strong className="text-white">Space / Shift</strong> for Nitro
-                  Boost, or use the bottom pedal controls.
+                  Steer with <strong className="text-white">W/A/S/D</strong>,{' '}
+                  <strong className="text-white">Left Shift</strong> for Nitro
+                  Boost.{' '}
+                  {combatMode && (
+                    <>
+                      Fire Machine Gun with{' '}
+                      <strong className="text-amber-300">Space / Left Click</strong>{' '}
+                      and Homing Missiles with{' '}
+                      <strong className="text-rose-400">F / Right Click</strong>.
+                    </>
+                  )}
                 </p>
               </div>
               <button
@@ -398,6 +759,20 @@ export default function App() {
                   <span className="font-mono-tabular font-semibold text-amber-400">
                     P{telemetry.position} / {telemetry.totalCars}
                   </span>
+                </div>
+                <div className="flex justify-between py-1 border-b border-white/5">
+                  <span>Combat Mode</span>
+                  <button
+                    type="button"
+                    onClick={() => setCombatMode((prev) => !prev)}
+                    className={`px-2.5 py-0.5 rounded font-semibold cursor-pointer ${
+                      combatMode
+                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                        : 'bg-white/10 text-slate-300'
+                    }`}
+                  >
+                    {combatMode ? 'Active (Weapons Enabled)' : 'Off (Pure Race)'}
+                  </button>
                 </div>
                 <div className="flex justify-between py-1 border-b border-white/5">
                   <span>Current Lap Time</span>
@@ -514,7 +889,7 @@ export default function App() {
                 <h3 className="font-display text-base font-bold text-white">
                   {activeModal === 'standings'
                     ? 'Live Circuit Classification'
-                    : 'Simulator Controls & Physics'}
+                    : 'Simulator Controls & Combat'}
                 </h3>
                 <button
                   type="button"
@@ -575,7 +950,7 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="space-y-2.5 text-xs text-slate-300">
+                <div className="space-y-2 text-xs text-slate-300">
                   <div className="flex justify-between py-1 border-b border-white/5">
                     <span className="text-slate-400">Accelerate / Brake</span>
                     <span className="font-mono-tabular text-white">
@@ -589,22 +964,36 @@ export default function App() {
                     </span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-white/5">
+                    <span className="text-slate-400">Machine Gun (4 HP)</span>
+                    <span className="font-mono-tabular text-amber-400">
+                      Space or Left Mouse Button
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-white/5">
+                    <span className="text-slate-400">Homing Missile (35 HP)</span>
+                    <span className="font-mono-tabular text-rose-400">
+                      F Key or Right Mouse Button
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-white/5">
                     <span className="text-slate-400">Nitro Boost Turbine</span>
                     <span className="font-mono-tabular text-cyan-400">
-                      Space or Left Shift
+                      Left Shift (or Space in Pure Race)
                     </span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-white/5">
+                    <span className="text-slate-400">Mute / Unmute Audio</span>
+                    <span className="font-mono-tabular text-white">M Key</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-white/5">
                     <span className="text-slate-400">Cycle Camera View</span>
                     <span className="font-mono-tabular text-white">C Key</span>
                   </div>
-                  <div className="flex justify-between py-1 border-b border-white/5">
-                    <span className="text-slate-400">Re-Center Car on Road</span>
-                    <span className="font-mono-tabular text-white">R Key</span>
-                  </div>
                   <div className="flex justify-between py-1">
-                    <span className="text-slate-400">Toggle Zen Mode Dock</span>
-                    <span className="font-mono-tabular text-white">H Key</span>
+                    <span className="text-slate-400">Re-Center / Hide Dock</span>
+                    <span className="font-mono-tabular text-white">
+                      R Key / H Key
+                    </span>
                   </div>
                 </div>
               )}
@@ -612,13 +1001,13 @@ export default function App() {
           </div>
         )}
 
-        {/* UNIFIED COLLAPSIBLE BOTTOM CONTROL DOCK (Three.js Skill Section 5 Contract) */}
+        {/* UNIFIED COLLAPSIBLE BOTTOM CONTROL DOCK */}
         <div
           style={{
             bottom: '16px',
             left: '50%',
             transform: 'translateX(-50%)',
-            maxWidth: 'min(940px, 95vw)',
+            maxWidth: 'min(960px, 96vw)',
           }}
           className="fixed z-20 w-full flex flex-col items-center pointer-events-none"
         >
@@ -641,10 +1030,10 @@ export default function App() {
             )}
           </button>
 
-          {/* Main Dock Container (Compositor transform transition, no backdrop-filter over WebGL) */}
+          {/* Main Dock Container */}
           {!isDockCollapsed && (
             <div className="pointer-events-auto w-full rounded-xl bg-[#0B0F19]/95 border border-white/15 px-4 py-3 shadow-2xl flex flex-col gap-3">
-              {/* Row 1: Speedometer + RPM/Nitro Bars + Touch Driving Pedals */}
+              {/* Row 1: Speedometer + RPM/Nitro Bars + Touch Driving & Weapon Pedals */}
               <div className="flex flex-wrap items-center justify-between gap-4">
                 {/* Digital Speedometer & Gear Indicator */}
                 <div className="flex items-center gap-3.5 shrink-0">
@@ -661,7 +1050,7 @@ export default function App() {
                     </span>
                   </div>
 
-                  <div className="min-w-[92px]">
+                  <div className="min-w-[116px]">
                     <div className="flex items-baseline gap-1.5">
                       <span className="font-display text-3xl font-bold tracking-tight text-white font-mono-tabular">
                         {telemetry.speedKmh}
@@ -670,14 +1059,25 @@ export default function App() {
                         KM/H
                       </span>
                     </div>
-                    <div className="text-[11px] text-slate-400 font-mono-tabular">
-                      {telemetry.rpm.toLocaleString()} RPM
+                    <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono-tabular">
+                      <span>{telemetry.rpm.toLocaleString()} RPM</span>
+                      {(telemetry.isSliding || telemetry.isTyreScrubbing) && (
+                        <span
+                          className={`font-semibold ${
+                            telemetry.isSliding
+                              ? 'text-rose-400'
+                              : 'text-amber-400'
+                          }`}
+                        >
+                          · {telemetry.isSliding ? 'Slide' : 'Tyre Scrub'}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
 
                 {/* RPM & Nitro Telemetry Bars */}
-                <div className="flex-1 min-w-[180px] max-w-xs space-y-2">
+                <div className="flex-1 min-w-[170px] max-w-xs space-y-2">
                   {/* Tachometer Bar */}
                   <div className="space-y-1">
                     <div className="flex justify-between text-[11px] font-mono-tabular">
@@ -687,10 +1087,22 @@ export default function App() {
                       </span>
                       <span
                         className={
-                          isRedline ? 'text-rose-400 font-bold' : 'text-slate-300'
+                          telemetry.isSliding
+                            ? 'text-rose-400 font-bold'
+                            : telemetry.isTyreScrubbing
+                              ? 'text-amber-400 font-semibold'
+                              : isRedline
+                                ? 'text-rose-400 font-bold'
+                                : 'text-slate-300'
                         }
                       >
-                        {isRedline ? 'SHIFT REDLINE' : 'OPTIMAL POWER'}
+                        {telemetry.isSliding
+                          ? 'SLIDE'
+                          : telemetry.isTyreScrubbing
+                            ? 'TYRE SCRUB'
+                            : isRedline
+                              ? 'SHIFT REDLINE'
+                              : 'OPTIMAL POWER'}
                       </span>
                     </div>
                     <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
@@ -726,32 +1138,32 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* On-Screen Interactive Steering, Throttle, Brake & Nitro Buttons */}
-                <div className="flex items-center gap-1.5 shrink-0">
+                {/* On-Screen Interactive Steering, Throttle, Brake, Nitro & Combat Buttons */}
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                   <button
                     type="button"
                     onPointerDown={() => setTouchInput('left', true)}
                     onPointerUp={() => setTouchInput('left', false)}
                     onPointerLeave={() => setTouchInput('left', false)}
-                    className="px-3 py-2 rounded-lg bg-white/8 hover:bg-white/15 active:bg-amber-400 active:text-slate-950 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="px-2.5 py-2 rounded-lg bg-white/8 hover:bg-white/15 active:bg-amber-400 active:text-slate-950 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    ◀ Left
+                    ◀
                   </button>
                   <button
                     type="button"
                     onPointerDown={() => setTouchInput('right', true)}
                     onPointerUp={() => setTouchInput('right', false)}
                     onPointerLeave={() => setTouchInput('right', false)}
-                    className="px-3 py-2 rounded-lg bg-white/8 hover:bg-white/15 active:bg-amber-400 active:text-slate-950 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="px-2.5 py-2 rounded-lg bg-white/8 hover:bg-white/15 active:bg-amber-400 active:text-slate-950 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    Right ▶
+                    ▶
                   </button>
                   <button
                     type="button"
                     onPointerDown={() => setTouchInput('brake', true)}
                     onPointerUp={() => setTouchInput('brake', false)}
                     onPointerLeave={() => setTouchInput('brake', false)}
-                    className="px-3 py-2 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-xs font-semibold text-rose-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="px-2.5 py-2 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-xs font-semibold text-rose-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     Brake
                   </button>
@@ -760,7 +1172,7 @@ export default function App() {
                     onPointerDown={() => setTouchInput('throttle', true)}
                     onPointerUp={() => setTouchInput('throttle', false)}
                     onPointerLeave={() => setTouchInput('throttle', false)}
-                    className="px-3.5 py-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-semibold text-emerald-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="px-3 py-2 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-semibold text-emerald-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     Throttle
                   </button>
@@ -778,17 +1190,41 @@ export default function App() {
                       setTouchInput('throttle', false);
                       setTouchInput('nitro', false);
                     }}
-                    className="px-3 py-2 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/35 border border-cyan-400/40 text-xs font-semibold text-cyan-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="px-2.5 py-2 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/35 border border-cyan-400/40 text-xs font-semibold text-cyan-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     Nitro
                   </button>
+                  {combatMode && (
+                    <>
+                      <button
+                        type="button"
+                        onPointerDown={() => setTouchInput('fireMg', true)}
+                        onPointerUp={() => setTouchInput('fireMg', false)}
+                        onPointerLeave={() => setTouchInput('fireMg', false)}
+                        className="px-2.5 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/35 border border-amber-400/40 text-xs font-semibold text-amber-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        MG
+                      </button>
+                      <button
+                        type="button"
+                        onPointerDown={() => setTouchInput('fireMissile', true)}
+                        onPointerUp={() => setTouchInput('fireMissile', false)}
+                        onPointerLeave={() =>
+                          setTouchInput('fireMissile', false)
+                        }
+                        className="px-2.5 py-2 rounded-lg bg-rose-500/25 hover:bg-rose-500/40 border border-rose-400/50 text-xs font-semibold text-rose-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        Missile ({telemetry.missileAmmo})
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 
               {/* Hairline Divider */}
               <div className="h-px w-full bg-white/10" />
 
-              {/* Row 2: Livery Swatches, Track Environment, Camera View, and Audio Controls */}
+              {/* Row 2: Livery Swatches, Combat Toggle, Track Environment, Camera View, and Audio Controls */}
               <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
                 {/* Livery Paint Swatches */}
                 <div className="flex items-center gap-2 shrink-0">
@@ -815,6 +1251,56 @@ export default function App() {
                       );
                     })}
                   </div>
+                </div>
+
+                {/* Combat Mode, AI Difficulty & Permanent Elimination Controls */}
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setCombatMode((prev) => !prev)}
+                    className={`px-2.5 py-1.5 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 ${
+                      combatMode
+                        ? 'bg-rose-500/20 border-rose-500/45 text-rose-300'
+                        : 'bg-white/5 border-white/10 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Crosshair className="w-3.5 h-3.5" />
+                    <span>{combatMode ? 'Combat: ON' : 'Pure Race'}</span>
+                  </button>
+
+                  {combatMode && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCombatDifficulty((prev) =>
+                          prev === 'easy'
+                            ? 'normal'
+                            : prev === 'normal'
+                              ? 'hard'
+                              : 'easy'
+                        )
+                      }
+                      className="px-2 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-mono-tabular text-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer uppercase"
+                      title="Cycle AI Combat Difficulty (Easy / Normal / Hard)"
+                    >
+                      AI: {combatDifficulty}
+                    </button>
+                  )}
+
+                  {combatMode && (
+                    <button
+                      type="button"
+                      onClick={() => setPermanentElimination((prev) => !prev)}
+                      className={`px-2 py-1.5 rounded-lg border text-xs font-mono-tabular transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        permanentElimination
+                          ? 'bg-rose-500/25 border-rose-400/50 text-rose-200 font-semibold'
+                          : 'bg-white/5 border-white/10 text-slate-400 hover:text-white'
+                      }`}
+                      title="Toggle Permanent Rival Elimination (no respawn)"
+                    >
+                      Perm. Elim: {permanentElimination ? 'ON' : 'OFF'}
+                    </button>
+                  )}
                 </div>
 
                 {/* Track Environment Segmented Selector */}
@@ -861,23 +1347,42 @@ export default function App() {
                   ))}
                 </div>
 
-                {/* Audio & Quick Actions */}
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={handleToggleMute}
-                    className="p-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 hover:text-white transition-colors cursor-pointer"
-                    title={isMuted ? 'Unmute Engine Audio' : 'Mute Engine Audio'}
-                    aria-label={
-                      isMuted ? 'Unmute Engine Audio' : 'Mute Engine Audio'
-                    }
-                  >
-                    {isMuted ? (
-                      <VolumeX className="w-4 h-4 text-rose-400" />
-                    ) : (
-                      <Volume2 className="w-4 h-4 text-emerald-400" />
-                    )}
-                  </button>
+                {/* Audio (Mute Button + Master Volume Slider) & Quick Actions */}
+                <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white/5 border border-white/10">
+                    <button
+                      type="button"
+                      onClick={handleToggleMute}
+                      className="p-1 text-slate-300 hover:text-white transition-colors cursor-pointer"
+                      title={
+                        isMuted
+                          ? 'Unmute Audio (M)'
+                          : 'Mute Audio (M)'
+                      }
+                      aria-label={
+                        isMuted
+                          ? 'Unmute Audio (M)'
+                          : 'Mute Audio (M)'
+                      }
+                    >
+                      {isMuted || masterVolume === 0 ? (
+                        <VolumeX className="w-4 h-4 text-rose-400" />
+                      ) : (
+                        <Volume2 className="w-4 h-4 text-emerald-400" />
+                      )}
+                    </button>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.02"
+                      value={isMuted ? 0 : masterVolume}
+                      onChange={handleVolumeChange}
+                      aria-label="Master Volume"
+                      title={`Master Volume: ${Math.round((isMuted ? 0 : masterVolume) * 100)}%`}
+                      className="w-16 h-1.5 accent-amber-400 bg-white/15 rounded-lg cursor-pointer"
+                    />
+                  </div>
                   <button
                     type="button"
                     onClick={() =>

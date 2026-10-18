@@ -9,6 +9,7 @@ import {
   CameraMode,
   CAR_LIVERIES,
   CarLivery,
+  CombatDifficulty,
   RaceStatus,
   RaceTelemetry,
   RivalCarState,
@@ -40,6 +41,8 @@ export interface TouchDriveControls {
   left: boolean;
   right: boolean;
   nitro: boolean;
+  fireMg: boolean;
+  fireMissile: boolean;
 }
 
 interface RacingCanvasProps {
@@ -47,6 +50,9 @@ interface RacingCanvasProps {
   livery: CarLivery;
   cameraMode: CameraMode;
   raceStatus: RaceStatus;
+  combatMode: boolean;
+  combatDifficulty: CombatDifficulty;
+  permanentElimination: boolean;
   totalLaps: number;
   resetSignal: number;
   touchControlsRef: React.MutableRefObject<TouchDriveControls>;
@@ -205,6 +211,10 @@ const _travelDir = new THREE.Vector3();
 const _camForward = new THREE.Vector3();
 const _camRight = new THREE.Vector3();
 const _carForward = new THREE.Vector3();
+const _carRight = new THREE.Vector3();
+const _toRival = new THREE.Vector3();
+const _aimDir = new THREE.Vector3();
+const _projVec = new THREE.Vector3();
 const _desiredCamPos = new THREE.Vector3();
 const _desiredLookAt = new THREE.Vector3();
 const _smoothedCamPos = new THREE.Vector3();
@@ -238,6 +248,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
   livery,
   cameraMode,
   raceStatus,
+  combatMode,
+  combatDifficulty,
+  permanentElimination,
   totalLaps,
   resetSignal,
   touchControlsRef,
@@ -253,6 +266,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     livery,
     cameraMode,
     raceStatus,
+    combatMode,
+    combatDifficulty,
+    permanentElimination,
     totalLaps,
     onTelemetryUpdate,
     onStatusChange,
@@ -264,6 +280,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       livery,
       cameraMode,
       raceStatus,
+      combatMode,
+      combatDifficulty,
+      permanentElimination,
       totalLaps,
       onTelemetryUpdate,
       onStatusChange,
@@ -273,6 +292,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     livery,
     cameraMode,
     raceStatus,
+    combatMode,
+    combatDifficulty,
+    permanentElimination,
     totalLaps,
     onTelemetryUpdate,
     onStatusChange,
@@ -471,10 +493,33 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     });
     scene.add(playerRig.root);
 
-    // Build 5 AI Rival Composite Hypercars
+    // Build 5 AI Rival Composite Hypercars + 3D World-Space Health Bars
     const rivalRigs: CompositeCarRig[] = [];
     const rivalsState: RivalCarState[] = [];
     const rivalHeadings: number[] = [];
+    const rivalHealthBarRigs: {
+      group: THREE.Group;
+      fillMesh: THREE.Mesh;
+      fillMat: THREE.MeshBasicMaterial;
+      lockBox: THREE.LineSegments;
+    }[] = [];
+
+    const hpBgGeo = new THREE.PlaneGeometry(1.1, 0.11);
+    const hpBgMat = new THREE.MeshBasicMaterial({
+      color: 0x090d16,
+      transparent: true,
+      opacity: 0.78,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const hpFillGeo = new THREE.PlaneGeometry(1.04, 0.07);
+    const lockBoxGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(2.15, 1.15, 4.3));
+    const lockBoxMat = new THREE.LineBasicMaterial({
+      color: 0xef4444,
+      transparent: true,
+      opacity: 0.85,
+    });
 
     AI_DRIVERS.forEach((driver, index) => {
       const rivalLivery = CAR_LIVERIES[driver.liveryIdx % CAR_LIVERIES.length];
@@ -483,6 +528,38 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       rig.headlightCones.forEach((c) => {
         c.visible = initialConfig.headlightsActive;
       });
+
+      // Compact 3D Floating Health Bar above each AI car (100 HP max)
+      const hbGroup = new THREE.Group();
+      hbGroup.position.set(0, 2.15, 0);
+      const bgMesh = new THREE.Mesh(hpBgGeo, hpBgMat);
+      bgMesh.renderOrder = 10;
+      hbGroup.add(bgMesh);
+
+      const fillMat = new THREE.MeshBasicMaterial({
+        color: 0x10b981,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      const fillMesh = new THREE.Mesh(hpFillGeo, fillMat);
+      fillMesh.position.set(0, 0, 0.01);
+      fillMesh.renderOrder = 11;
+      hbGroup.add(fillMesh);
+      rig.root.add(hbGroup);
+
+      const lockBox = new THREE.LineSegments(lockBoxGeo, lockBoxMat);
+      lockBox.position.set(0, 0.65, 0);
+      lockBox.visible = false;
+      rig.root.add(lockBox);
+
+      rivalHealthBarRigs.push({
+        group: hbGroup,
+        fillMesh,
+        fillMat,
+        lockBox,
+      });
+
       scene.add(rig.root);
       rivalRigs.push(rig);
 
@@ -504,6 +581,15 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         baseMaxSpeed: driver.baseSpeed,
         lap: 1,
         gapSeconds: 0,
+        hp: 100,
+        maxHp: 100,
+        isEliminated: false,
+        respawnTimer: 0,
+        hitSlowTimer: 0,
+        hitFlashTimer: 0,
+        aiFireCooldown: 0.4 + index * 0.25,
+        aiBurstRemaining: 3,
+        aiReloadTimer: 1.4 + index * 0.45,
       });
     });
 
@@ -584,8 +670,597 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     const gravelDustPoints = new THREE.Points(gravelDustGeo, gravelDustMat);
     playerRig.root.add(gravelDustPoints);
 
-    // Mutable Driving & Race State
+    // 4. Pooled Collision & Hit Spark Particles (World-Space, Zero-GC Pool)
+    const sparkPoolCount = 48;
+    const sparkGeo = new THREE.BufferGeometry();
+    const sparkPositions = new Float32Array(sparkPoolCount * 3);
+    const sparkVelocities = new Float32Array(sparkPoolCount * 3);
+    const sparkLifetimes = new Float32Array(sparkPoolCount);
+    for (let i = 0; i < sparkPoolCount; i++) {
+      sparkPositions[i * 3 + 1] = -999; // hidden below ground when inactive
+      sparkLifetimes[i] = 0;
+    }
+    sparkGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(sparkPositions, 3)
+    );
+    const sparkMat = createSoftAdditiveParticleMaterial(
+      softParticleSpriteTex,
+      0xfbbf24,
+      0.58,
+      0.95,
+      1.2,
+      3.5
+    );
+    const sparkPoints = new THREE.Points(sparkGeo, sparkMat);
+    sparkPoints.frustumCulled = false;
+    scene.add(sparkPoints);
+
+    let sparkCursor = 0;
+    const spawnCollisionSparks = (
+      wx: number,
+      wy: number,
+      wz: number,
+      count: number,
+      impactScale: number
+    ) => {
+      const posAttr = sparkGeo.getAttribute(
+        'position'
+      ) as THREE.BufferAttribute;
+      for (let k = 0; k < count; k++) {
+        const idx = sparkCursor % sparkPoolCount;
+        sparkCursor++;
+        posAttr.setXYZ(
+          idx,
+          wx + (Math.random() - 0.5) * 0.6,
+          wy + 0.45 + Math.random() * 0.35,
+          wz + (Math.random() - 0.5) * 0.6
+        );
+        const speedSpread = 5.5 + impactScale * 9.5;
+        sparkVelocities[idx * 3] = (Math.random() - 0.5) * speedSpread;
+        sparkVelocities[idx * 3 + 1] = 2.8 + Math.random() * 5.2;
+        sparkVelocities[idx * 3 + 2] = (Math.random() - 0.5) * speedSpread;
+        sparkLifetimes[idx] = 0.24 + Math.random() * 0.18;
+      }
+      posAttr.needsUpdate = true;
+    };
+
+    // 5. Pooled Smoke Trail (Missile Exhaust + <=30% HP Car Engine Smoke, Zero-GC Pool)
+    const smokePoolCount = 96;
+    const smokeGeo = new THREE.BufferGeometry();
+    const smokePositions = new Float32Array(smokePoolCount * 3);
+    const smokeVelocities = new Float32Array(smokePoolCount * 3);
+    const smokeLifetimes = new Float32Array(smokePoolCount);
+    for (let i = 0; i < smokePoolCount; i++) {
+      smokePositions[i * 3 + 1] = -999;
+      smokeLifetimes[i] = 0;
+    }
+    smokeGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(smokePositions, 3)
+    );
+    const smokeMat = createSoftAdditiveParticleMaterial(
+      softParticleSpriteTex,
+      0x94a3b8,
+      1.65,
+      0.52,
+      1.5,
+      4.5
+    );
+    const smokePoints = new THREE.Points(smokeGeo, smokeMat);
+    smokePoints.frustumCulled = false;
+    scene.add(smokePoints);
+
+    let smokeCursor = 0;
+    const spawnSmokePuff = (
+      wx: number,
+      wy: number,
+      wz: number,
+      vx: number,
+      vy: number,
+      vz: number,
+      life: number = 0.55
+    ) => {
+      const posAttr = smokeGeo.getAttribute(
+        'position'
+      ) as THREE.BufferAttribute;
+      const idx = smokeCursor % smokePoolCount;
+      smokeCursor++;
+      posAttr.setXYZ(
+        idx,
+        wx + (Math.random() - 0.5) * 0.35,
+        wy + (Math.random() - 0.5) * 0.25,
+        wz + (Math.random() - 0.5) * 0.35
+      );
+      smokeVelocities[idx * 3] = vx + (Math.random() - 0.5) * 1.6;
+      smokeVelocities[idx * 3 + 1] = vy + 1.8 + Math.random() * 1.5;
+      smokeVelocities[idx * 3 + 2] = vz + (Math.random() - 0.5) * 1.6;
+      smokeLifetimes[idx] = life;
+      posAttr.needsUpdate = true;
+    };
+
+    // 6. Pooled Glowing Machine Gun Tracer Streaks (Zero-GC Pool)
+    const BULLET_POOL_SIZE = 32;
+    const tracerGeo = new THREE.BoxGeometry(0.09, 0.09, 2.35);
+    const playerTracerMat = new THREE.MeshBasicMaterial({
+      color: 0xfef08a,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+    });
+    const rivalTracerMat = new THREE.MeshBasicMaterial({
+      color: 0xfb7185,
+      transparent: true,
+      opacity: 0.92,
+      blending: THREE.AdditiveBlending,
+    });
+
+    interface PooledBullet {
+      active: boolean;
+      isPlayer: boolean;
+      ownerIdx: number;
+      x: number;
+      y: number;
+      z: number;
+      vx: number;
+      vy: number;
+      vz: number;
+      life: number;
+      mesh: THREE.Mesh;
+    }
+    const bulletPool: PooledBullet[] = [];
+    for (let i = 0; i < BULLET_POOL_SIZE; i++) {
+      const mesh = new THREE.Mesh(tracerGeo, playerTracerMat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      scene.add(mesh);
+      bulletPool.push({
+        active: false,
+        isPlayer: true,
+        ownerIdx: -1,
+        x: 0,
+        y: -999,
+        z: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        life: 0,
+        mesh,
+      });
+    }
+    let bulletCursor = 0;
+
+    const spawnBullet = (
+      isPlayer: boolean,
+      ownerIdx: number,
+      wx: number,
+      wy: number,
+      wz: number,
+      dirX: number,
+      dirY: number,
+      dirZ: number,
+      baseSpeed: number
+    ) => {
+      const b = bulletPool[bulletCursor % BULLET_POOL_SIZE];
+      bulletCursor++;
+      b.active = true;
+      b.isPlayer = isPlayer;
+      b.ownerIdx = ownerIdx;
+      b.x = wx;
+      b.y = wy;
+      b.z = wz;
+      const projectileSpeed = baseSpeed + 145;
+      b.vx = dirX * projectileSpeed;
+      b.vy = dirY * projectileSpeed;
+      b.vz = dirZ * projectileSpeed;
+      b.life = 1.15;
+      b.mesh.material = isPlayer ? playerTracerMat : rivalTracerMat;
+      b.mesh.position.set(wx, wy, wz);
+      b.mesh.lookAt(wx + dirX, wy + dirY, wz + dirZ);
+      b.mesh.visible = true;
+    };
+
+    // 7. Pooled Homing Missiles (Small Composite Rockets with Smoke Trail, Zero-GC Pool)
+    const MISSILE_POOL_SIZE = 6;
+    const missileBodyGeo = new THREE.CylinderGeometry(0.11, 0.14, 1.35, 8);
+    missileBodyGeo.rotateX(Math.PI * 0.5);
+    const missileNoseGeo = new THREE.ConeGeometry(0.11, 0.42, 8);
+    missileNoseGeo.rotateX(Math.PI * 0.5);
+    missileNoseGeo.translate(0, 0, 0.88);
+    const missileFinGeo = new THREE.BoxGeometry(0.48, 0.04, 0.32);
+    missileFinGeo.translate(0, 0, -0.52);
+    const missileFlareGeo = new THREE.SphereGeometry(0.16, 8, 8);
+    missileFlareGeo.translate(0, 0, -0.72);
+
+    const missileBodyMat = new THREE.MeshStandardMaterial({
+      color: 0xf8fafc,
+      metalness: 0.6,
+      roughness: 0.25,
+    });
+    const missileNoseMat = new THREE.MeshStandardMaterial({
+      color: 0xef4444,
+      emissive: 0xef4444,
+      emissiveIntensity: 0.8,
+      roughness: 0.3,
+    });
+    const missileFinMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      metalness: 0.8,
+      roughness: 0.4,
+    });
+    const missileFlareMat = new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      blending: THREE.AdditiveBlending,
+    });
+
+    interface PooledMissile {
+      active: boolean;
+      x: number;
+      y: number;
+      z: number;
+      vx: number;
+      vy: number;
+      vz: number;
+      life: number;
+      targetIdx: number;
+      smokeTimer: number;
+      group: THREE.Group;
+    }
+    const missilePool: PooledMissile[] = [];
+    for (let i = 0; i < MISSILE_POOL_SIZE; i++) {
+      const grp = new THREE.Group();
+      grp.add(new THREE.Mesh(missileBodyGeo, missileBodyMat));
+      grp.add(new THREE.Mesh(missileNoseGeo, missileNoseMat));
+      const fin1 = new THREE.Mesh(missileFinGeo, missileFinMat);
+      const fin2 = new THREE.Mesh(missileFinGeo, missileFinMat);
+      fin2.rotation.z = Math.PI * 0.5;
+      grp.add(fin1);
+      grp.add(fin2);
+      grp.add(new THREE.Mesh(missileFlareGeo, missileFlareMat));
+      grp.visible = false;
+      scene.add(grp);
+      missilePool.push({
+        active: false,
+        x: 0,
+        y: -999,
+        z: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        life: 0,
+        targetIdx: -1,
+        smokeTimer: 0,
+        group: grp,
+      });
+    }
+    let missileCursor = 0;
+
+    // 8. Pooled Muzzle Flashes (Glowing Star Burst at Gun Barrel / Missile Tube, Zero-GC Pool)
+    const MUZZLE_FLASH_POOL_SIZE = 8;
+    const muzzleFlashGeo = new THREE.OctahedronGeometry(0.32, 0);
+    interface PooledMuzzleFlash {
+      active: boolean;
+      timer: number;
+      duration: number;
+      mesh: THREE.Mesh;
+      mat: THREE.MeshBasicMaterial;
+    }
+    const muzzleFlashPool: PooledMuzzleFlash[] = [];
+    for (let i = 0; i < MUZZLE_FLASH_POOL_SIZE; i++) {
+      const mfMat = new THREE.MeshBasicMaterial({
+        color: 0xfef08a,
+        transparent: true,
+        opacity: 0.0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const mfMesh = new THREE.Mesh(muzzleFlashGeo, mfMat);
+      mfMesh.visible = false;
+      mfMesh.frustumCulled = false;
+      scene.add(mfMesh);
+      muzzleFlashPool.push({
+        active: false,
+        timer: 0,
+        duration: 0.065,
+        mesh: mfMesh,
+        mat: mfMat,
+      });
+    }
+    let muzzleFlashCursor = 0;
+
+    const spawnMuzzleFlash = (
+      wx: number,
+      wy: number,
+      wz: number,
+      scaleMult: number = 1.0,
+      colorHex: number = 0xfef08a
+    ) => {
+      const mf = muzzleFlashPool[muzzleFlashCursor % MUZZLE_FLASH_POOL_SIZE];
+      muzzleFlashCursor++;
+      mf.active = true;
+      mf.timer = 0;
+      mf.duration = 0.065 * scaleMult;
+      mf.mat.color.setHex(colorHex);
+      mf.mat.opacity = 0.96;
+      mf.mesh.position.set(wx, wy, wz);
+      mf.mesh.rotation.set(
+        Math.random() * Math.PI,
+        Math.random() * Math.PI,
+        Math.random() * Math.PI
+      );
+      mf.mesh.scale.setScalar(0.85 * scaleMult);
+      mf.mesh.visible = true;
+    };
+
+    // 9. Pooled Floating Track Pickups (Repair +30 HP & Ammo +Missiles, 15s Respawn)
+    const pickupCrossVGeo = new THREE.BoxGeometry(0.32, 1.05, 0.32);
+    const pickupCrossHGeo = new THREE.BoxGeometry(1.05, 0.32, 0.32);
+    const pickupAmmoOctGeo = new THREE.OctahedronGeometry(0.58, 0);
+    const pickupRingGeo = new THREE.RingGeometry(0.85, 1.12, 24);
+    pickupRingGeo.rotateX(-Math.PI * 0.5);
+
+    const repairPickupMat = new THREE.MeshStandardMaterial({
+      color: 0x10b981,
+      emissive: 0x10b981,
+      emissiveIntensity: 1.4,
+      roughness: 0.2,
+      metalness: 0.5,
+    });
+    const repairRingMat = new THREE.MeshBasicMaterial({
+      color: 0x34d399,
+      transparent: true,
+      opacity: 0.78,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const ammoPickupMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x0ea5e9,
+      emissiveIntensity: 1.4,
+      roughness: 0.2,
+      metalness: 0.7,
+    });
+    const ammoRingMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.78,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+
+    interface TrackPickupNode {
+      type: 'repair' | 'ammo';
+      trackDistance: number;
+      lateralOffset: number;
+      basePos: THREE.Vector3;
+      active: boolean;
+      respawnTimer: number;
+      group: THREE.Group;
+      coreGroup: THREE.Group;
+    }
+
+    const PICKUP_SPOTS: {
+      type: 'repair' | 'ammo';
+      fraction: number;
+      lateral: number;
+    }[] = [
+      { type: 'ammo', fraction: 0.11, lateral: -3.1 },
+      { type: 'repair', fraction: 0.23, lateral: 3.1 },
+      { type: 'ammo', fraction: 0.35, lateral: -2.7 },
+      { type: 'repair', fraction: 0.48, lateral: 2.8 },
+      { type: 'ammo', fraction: 0.61, lateral: -3.2 },
+      { type: 'repair', fraction: 0.73, lateral: 3.0 },
+      { type: 'ammo', fraction: 0.84, lateral: -2.5 },
+      { type: 'repair', fraction: 0.94, lateral: 2.9 },
+    ];
+
+    const pickupPool: TrackPickupNode[] = PICKUP_SPOTS.map((spot) => {
+      const dist = spot.fraction * TRACK_LENGTH;
+      evaluateTrackFrame(dist, _camFrame);
+      const basePos = _camFrame.position
+        .clone()
+        .addScaledVector(_camFrame.right, spot.lateral);
+
+      const group = new THREE.Group();
+      group.position.copy(basePos);
+
+      const coreGroup = new THREE.Group();
+      coreGroup.position.y = 1.05;
+
+      if (spot.type === 'repair') {
+        coreGroup.add(new THREE.Mesh(pickupCrossVGeo, repairPickupMat));
+        coreGroup.add(new THREE.Mesh(pickupCrossHGeo, repairPickupMat));
+        const ring = new THREE.Mesh(pickupRingGeo, repairRingMat);
+        ring.position.y = 0.08;
+        group.add(ring);
+      } else {
+        coreGroup.add(new THREE.Mesh(pickupAmmoOctGeo, ammoPickupMat));
+        const ring = new THREE.Mesh(pickupRingGeo, ammoRingMat);
+        ring.position.y = 0.08;
+        group.add(ring);
+      }
+
+      group.add(coreGroup);
+      scene.add(group);
+
+      return {
+        type: spot.type,
+        trackDistance: dist,
+        lateralOffset: spot.lateral,
+        basePos,
+        active: true,
+        respawnTimer: 0,
+        group,
+        coreGroup,
+      };
+    });
+
+    // 10. Pooled Stylized Arcade Explosions (Fireball Sphere + Shockwave Ring + Debris Cubes)
+    const EXPLOSION_POOL_SIZE = 4;
+    const fireballGeo = new THREE.SphereGeometry(1.0, 14, 12);
+    const shockwaveGeo = new THREE.RingGeometry(0.65, 1.0, 24);
+    shockwaveGeo.rotateX(-Math.PI * 0.5);
+
+    interface PooledExplosion {
+      active: boolean;
+      timer: number;
+      duration: number;
+      fireballMesh: THREE.Mesh;
+      fireballMat: THREE.MeshBasicMaterial;
+      ringMesh: THREE.Mesh;
+      ringMat: THREE.MeshBasicMaterial;
+    }
+    const explosionPool: PooledExplosion[] = [];
+    for (let i = 0; i < EXPLOSION_POOL_SIZE; i++) {
+      const fbMat = new THREE.MeshBasicMaterial({
+        color: 0xf97316,
+        transparent: true,
+        opacity: 0.0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const fbMesh = new THREE.Mesh(fireballGeo, fbMat);
+      fbMesh.visible = false;
+      scene.add(fbMesh);
+
+      const rgMat = new THREE.MeshBasicMaterial({
+        color: 0xfef08a,
+        transparent: true,
+        opacity: 0.0,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const rgMesh = new THREE.Mesh(shockwaveGeo, rgMat);
+      rgMesh.visible = false;
+      scene.add(rgMesh);
+
+      explosionPool.push({
+        active: false,
+        timer: 0,
+        duration: 0.65,
+        fireballMesh: fbMesh,
+        fireballMat: fbMat,
+        ringMesh: rgMesh,
+        ringMat: rgMat,
+      });
+    }
+    let explosionCursor = 0;
+
+    const DEBRIS_POOL_SIZE = 28;
+    const debrisGeo = new THREE.BoxGeometry(0.32, 0.22, 0.38);
+    const debrisMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      emissive: 0xf97316,
+      emissiveIntensity: 0.65,
+      roughness: 0.4,
+      metalness: 0.7,
+    });
+    interface PooledDebris {
+      active: boolean;
+      life: number;
+      vx: number;
+      vy: number;
+      vz: number;
+      rx: number;
+      ry: number;
+      mesh: THREE.Mesh;
+    }
+    const debrisPool: PooledDebris[] = [];
+    for (let i = 0; i < DEBRIS_POOL_SIZE; i++) {
+      const dMesh = new THREE.Mesh(debrisGeo, debrisMat);
+      dMesh.visible = false;
+      scene.add(dMesh);
+      debrisPool.push({
+        active: false,
+        life: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        rx: 0,
+        ry: 0,
+        mesh: dMesh,
+      });
+    }
+    let debrisCursor = 0;
+
+    const spawnStylizedExplosion = (wx: number, wy: number, wz: number) => {
+      soundEngine.playExplosion();
+
+      // Short camera shake on explosions scaled by distance to player
+      const dx = wx - _carWorldPos.x;
+      const dz = wz - _carWorldPos.z;
+      const distToPlayer = Math.sqrt(dx * dx + dz * dz);
+      const shakeProximity = THREE.MathUtils.clamp(
+        1.0 - distToPlayer / 110.0,
+        0.22,
+        1.0
+      );
+      playerState.cameraShakeTimer = Math.max(
+        playerState.cameraShakeTimer,
+        0.38
+      );
+      playerState.cameraShakeIntensity = Math.max(
+        playerState.cameraShakeIntensity,
+        0.16 + shakeProximity * 0.34
+      );
+
+      const exp = explosionPool[explosionCursor % EXPLOSION_POOL_SIZE];
+      explosionCursor++;
+      exp.active = true;
+      exp.timer = 0;
+      exp.duration = 0.68;
+      exp.fireballMesh.position.set(wx, wy + 0.7, wz);
+      exp.fireballMesh.scale.setScalar(0.5);
+      exp.fireballMat.opacity = 0.95;
+      exp.fireballMesh.visible = true;
+
+      exp.ringMesh.position.set(wx, wy + 0.15, wz);
+      exp.ringMesh.scale.setScalar(0.8);
+      exp.ringMat.opacity = 0.9;
+      exp.ringMesh.visible = true;
+
+      for (let k = 0; k < 9; k++) {
+        const deb = debrisPool[debrisCursor % DEBRIS_POOL_SIZE];
+        debrisCursor++;
+        deb.active = true;
+        deb.life = 0.75 + Math.random() * 0.35;
+        deb.mesh.position.set(
+          wx + (Math.random() - 0.5) * 1.2,
+          wy + 0.5 + Math.random() * 0.6,
+          wz + (Math.random() - 0.5) * 1.2
+        );
+        deb.vx = (Math.random() - 0.5) * 18;
+        deb.vy = 6.5 + Math.random() * 9.5;
+        deb.vz = (Math.random() - 0.5) * 18;
+        deb.rx = (Math.random() - 0.5) * 14;
+        deb.ry = (Math.random() - 0.5) * 14;
+        deb.mesh.visible = true;
+      }
+
+      spawnCollisionSparks(wx, wy + 0.4, wz, 20, 1.0);
+      for (let s = 0; s < 8; s++) {
+        spawnSmokePuff(
+          wx + (Math.random() - 0.5) * 1.5,
+          wy + 0.6,
+          wz + (Math.random() - 0.5) * 1.5,
+          (Math.random() - 0.5) * 4,
+          2.5 + Math.random() * 3,
+          (Math.random() - 0.5) * 4,
+          0.85
+        );
+      }
+    };
+
+    // Per-pair 0.3s collision cooldowns & overtake/corner tracking
+    const collisionCooldowns: Record<string, number> = {};
+    const rivalWasAhead: boolean[] = AI_DRIVERS.map(() => true);
+
+    // Mutable Driving, Race & Combat State
     const keys: Record<string, boolean> = {};
+    const mouseButtons = { left: false, right: false };
     const playerState = {
       trackDistance: 0, // meters from start
       lateralOffset: 0, // -ROAD_HALF_WIDTH..+ROAD_HALF_WIDTH
@@ -596,6 +1271,15 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       visualHeading: 0, // smoothly interpolated yaw applied to rotation.y
       camHeading: 0, // smoothly damped chase camera yaw following car heading
       driftAngle: 0, // radians visual slip angle
+      spinYawVelocity: 0, // post-collision spin yaw rate (decays over ~1s)
+      spinOffsetAngle: 0, // accumulated spin angle offset decaying back to 0
+      cameraShakeTimer: 0, // remaining camera shake time (s)
+      cameraShakeIntensity: 0, // shake amplitude
+      wallHitCooldown: 0, // 0.3s cooldown for barrier hits
+      inCornerZone: false,
+      cornerClean: true,
+      scoreEventLabel: null as string | null,
+      scoreEventTimer: 0,
       nitro: 100, // 0..100
       lap: 1,
       currentLapTimeMs: 0,
@@ -606,6 +1290,47 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       countdownTimer: 3.4,
       lastCountdownInt: 4,
       padBoostTimer: 0,
+      // Combat state
+      hp: 100,
+      maxHp: 100,
+      isDestroyed: false,
+      respawnTimer: 0,
+      invulnerableTimer: 0,
+      hitFlashTimer: 0,
+      mgHeat: 0,
+      mgOverheated: false,
+      mgFireTimer: 0,
+      mgBarrelToggle: 1,
+      missileAmmo: 6,
+      missileMaxAmmo: 6,
+      missileCooldown: 0,
+      missileRechargeTimer: 0,
+      kills: 0,
+      killFeed: [] as {
+        id: string;
+        message: string;
+        timestamp: number;
+        isPlayerKill: boolean;
+      }[],
+      lockedRivalIdx: -1,
+      damageSmokeTimer: 0,
+    };
+
+    const triggerScoreEvent = (label: string) => {
+      playerState.scoreEventLabel = label;
+      playerState.scoreEventTimer = 1.8;
+    };
+
+    const pushKillFeed = (message: string, isPlayerKill: boolean) => {
+      playerState.killFeed = [
+        {
+          id: `${Date.now()}_${Math.random()}`,
+          message,
+          timestamp: performance.now(),
+          isPlayerKill,
+        },
+        ...playerState.killFeed.slice(0, 3),
+      ];
     };
 
     const resetRaceState = () => {
@@ -624,6 +1349,15 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       playerState.visualHeading = startYaw;
       playerState.camHeading = startYaw;
       playerState.driftAngle = 0;
+      playerState.spinYawVelocity = 0;
+      playerState.spinOffsetAngle = 0;
+      playerState.cameraShakeTimer = 0;
+      playerState.cameraShakeIntensity = 0;
+      playerState.wallHitCooldown = 0;
+      playerState.inCornerZone = false;
+      playerState.cornerClean = true;
+      playerState.scoreEventLabel = null;
+      playerState.scoreEventTimer = 0;
       playerState.nitro = 100;
       playerState.lap = 1;
       playerState.currentLapTimeMs = 0;
@@ -634,6 +1368,48 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       playerState.lastCountdownInt = 4;
       playerState.padBoostTimer = 0;
 
+      playerState.hp = 100;
+      playerState.isDestroyed = false;
+      playerState.respawnTimer = 0;
+      playerState.invulnerableTimer = 0;
+      playerState.hitFlashTimer = 0;
+      playerState.mgHeat = 0;
+      playerState.mgOverheated = false;
+      playerState.mgFireTimer = 0;
+      playerState.missileAmmo = 6;
+      playerState.missileCooldown = 0;
+      playerState.missileRechargeTimer = 0;
+      playerState.kills = 0;
+      playerState.killFeed = [];
+      playerState.lockedRivalIdx = -1;
+      playerRig.root.visible = true;
+      playerRig.paintMaterials.forEach((mat) => {
+        mat.emissive.setHex(0x000000);
+        mat.emissiveIntensity = 0;
+      });
+
+      bulletPool.forEach((b) => {
+        b.active = false;
+        b.mesh.visible = false;
+      });
+      missilePool.forEach((m) => {
+        m.active = false;
+        m.group.visible = false;
+      });
+      muzzleFlashPool.forEach((mf) => {
+        mf.active = false;
+        mf.mesh.visible = false;
+      });
+      pickupPool.forEach((pk) => {
+        pk.active = true;
+        pk.respawnTimer = 0;
+        pk.group.visible = propsRef.current.combatMode;
+      });
+
+      Object.keys(collisionCooldowns).forEach((k) => {
+        collisionCooldowns[k] = 0;
+      });
+
       rivalsState.forEach((rival, idx) => {
         rival.trackDistance = (idx + 1) * 11;
         rival.lateralOffset = idx % 2 === 0 ? 3.6 : -3.6;
@@ -641,6 +1417,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         rival.speed = 0;
         rival.lap = 1;
         rival.gapSeconds = 0;
+        rival.hp = 100;
+        rival.maxHp = 100;
+        rival.isEliminated = false;
+        rival.respawnTimer = 0;
+        rival.hitSlowTimer = 0;
+        rival.hitFlashTimer = 0;
+        rival.aiFireCooldown = 0.4 + idx * 0.25;
+        rival.aiBurstRemaining = 3;
+        rival.aiReloadTimer = 1.4 + idx * 0.45;
+        rivalWasAhead[idx] = true;
+        rivalRigs[idx].root.visible = true;
+        rivalRigs[idx].paintMaterials.forEach((mat) => {
+          mat.emissive.setHex(0x000000);
+          mat.emissiveIntensity = 0;
+        });
 
         evaluateTrackFrame(rival.trackDistance, _rivalFrame);
         rivalHeadings[idx] = Math.atan2(
@@ -682,18 +1473,40 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     const onKeyDown = (e: KeyboardEvent) => {
       keys[e.code] = true;
       soundEngine.init();
+      if (e.code === 'Space' && propsRef.current.raceStatus === 'racing') {
+        e.preventDefault();
+      }
       if (e.code === 'KeyR') {
         playerState.lateralOffset = 0;
         playerState.lateralVelocity = 0;
         playerState.driftAngle = 0;
+        playerState.spinYawVelocity = 0;
+        playerState.spinOffsetAngle = 0;
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       keys[e.code] = false;
     };
+    const onMouseDown = (e: MouseEvent) => {
+      soundEngine.init();
+      if (e.button === 0) mouseButtons.left = true;
+      if (e.button === 2) mouseButtons.right = true;
+    };
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button === 0) mouseButtons.left = false;
+      if (e.button === 2) mouseButtons.right = false;
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      if (propsRef.current.combatMode) {
+        e.preventDefault();
+      }
+    };
 
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    renderer.domElement.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mouseup', onMouseUp);
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     const handleResize = () => {
       if (!container) return;
@@ -706,10 +1519,105 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         composer.setSize(w, h);
       }
       if (bloomPass) {
-        bloomPass.resolution.set(Math.max(1, Math.floor(w * 0.5)), Math.max(1, Math.floor(h * 0.5)));
+        bloomPass.resolution.set(
+          Math.max(1, Math.floor(w * 0.5)),
+          Math.max(1, Math.floor(h * 0.5))
+        );
       }
     };
     window.addEventListener('resize', handleResize);
+
+    // Helper to apply damage to a rival car (with hit flash, sparks, 0.5s slowdown, and 0 HP explosion)
+    const damageRival = (
+      rivalIdx: number,
+      damageAmount: number,
+      byPlayer: boolean
+    ) => {
+      const rival = rivalsState[rivalIdx];
+      const rig = rivalRigs[rivalIdx];
+      if (!rival || rival.isEliminated) return;
+
+      rival.hp = Math.max(0, rival.hp - damageAmount);
+      rival.hitFlashTimer = 0.14;
+      rival.hitSlowTimer = 0.5; // brief 0.5s slowdown on hit
+      rig.paintMaterials.forEach((mat) => {
+        mat.emissive.setHex(0xffffff);
+        mat.emissiveIntensity = 1.65;
+      });
+
+      spawnCollisionSparks(
+        rig.root.position.x,
+        rig.root.position.y + 0.5,
+        rig.root.position.z,
+        8,
+        0.55
+      );
+
+      if (byPlayer) {
+        soundEngine.playHitConfirm();
+        playerState.driftScore += 50;
+        triggerScoreEvent(`Target Hit +50`);
+      }
+
+      if (rival.hp <= 0) {
+        rival.isEliminated = true;
+        rival.respawnTimer = 5.0; // Respawn at back of pack after 5s with 50 HP (unless permanent elimination is ON)
+        rival.speed = 0;
+        rig.root.visible = false;
+        spawnStylizedExplosion(
+          rig.root.position.x,
+          rig.root.position.y,
+          rig.root.position.z
+        );
+
+        const permSuffix = propsRef.current.permanentElimination ? ' [OUT]' : '';
+        if (byPlayer) {
+          playerState.kills += 1;
+          playerState.driftScore += 300;
+          triggerScoreEvent(`ELIMINATED ${rival.driverName}${permSuffix} +300`);
+          pushKillFeed(
+            `ELIMINATED ${rival.driverName}${permSuffix} (+300)`,
+            true
+          );
+        } else {
+          pushKillFeed(`${rival.driverName} ELIMINATED${permSuffix}`, false);
+        }
+      }
+    };
+
+    // Helper to apply damage to the player car
+    const damagePlayer = (damageAmount: number, sourceLabel: string) => {
+      if (
+        !propsRef.current.combatMode ||
+        playerState.isDestroyed ||
+        playerState.invulnerableTimer > 0
+      ) {
+        return;
+      }
+      playerState.hp = Math.max(0, playerState.hp - damageAmount);
+      playerState.hitFlashTimer = 0.14;
+      soundEngine.playHitConfirm();
+      playerRig.paintMaterials.forEach((mat) => {
+        mat.emissive.setHex(0xef4444);
+        mat.emissiveIntensity = 1.6;
+      });
+
+      if (playerState.hp <= 0) {
+        playerState.isDestroyed = true;
+        playerState.respawnTimer = 3.0; // Respawn after 3 seconds
+        playerState.speed = 0;
+        playerState.lateralVelocity = 0;
+        playerState.driftScore = Math.max(0, playerState.driftScore - 100);
+        playerRig.root.visible = false;
+        triggerScoreEvent(`DESTROYED -100`);
+        pushKillFeed(`YOU WERE ELIMINATED BY ${sourceLabel} (-100)`, false);
+        spawnStylizedExplosion(
+          _carWorldPos.x,
+          _carWorldPos.y,
+          _carWorldPos.z
+        );
+      }
+    };
 
     const clock = new THREE.Clock();
     let animFrameId = 0;
@@ -724,12 +1632,107 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       const {
         raceStatus: currentStatus,
         cameraMode: currentCamMode,
+        combatMode: isCombatMode,
+        combatDifficulty: currentDifficulty,
+        permanentElimination: isPermanentElimination,
         totalLaps: maxLaps,
         onTelemetryUpdate: emitTelemetry,
         onStatusChange: setStatus,
       } = propsRef.current;
 
       const activeTrack = sceneObjectsRef.current?.builtTrack;
+
+      // AI Shooting Difficulty Configuration (Easy, Normal, Hard)
+      const aiDifficultyConfig =
+        currentDifficulty === 'easy'
+          ? {
+              burstInterval: 0.24,
+              burstCount: 3,
+              reloadDelay: 4.2,
+              spreadRad: THREE.MathUtils.degToRad(9.5),
+              maxRange: 46,
+            }
+          : currentDifficulty === 'hard'
+            ? {
+                burstInterval: 0.11,
+                burstCount: 6,
+                reloadDelay: 1.75,
+                spreadRad: THREE.MathUtils.degToRad(2.6),
+                maxRange: 78,
+              }
+            : {
+                burstInterval: 0.16,
+                burstCount: 4,
+                reloadDelay: 2.8,
+                spreadRad: THREE.MathUtils.degToRad(5.5),
+                maxRange: 62,
+              };
+
+      // Tick down collision cooldowns & score banner timer
+      for (const key in collisionCooldowns) {
+        if (collisionCooldowns[key] > 0) {
+          collisionCooldowns[key] = Math.max(0, collisionCooldowns[key] - dt);
+        }
+      }
+      if (playerState.wallHitCooldown > 0) {
+        playerState.wallHitCooldown = Math.max(
+          0,
+          playerState.wallHitCooldown - dt
+        );
+      }
+      if (playerState.cameraShakeTimer > 0) {
+        playerState.cameraShakeTimer = Math.max(
+          0,
+          playerState.cameraShakeTimer - dt
+        );
+      }
+      if (playerState.scoreEventTimer > 0) {
+        playerState.scoreEventTimer = Math.max(
+          0,
+          playerState.scoreEventTimer - dt
+        );
+        if (playerState.scoreEventTimer <= 0) {
+          playerState.scoreEventLabel = null;
+        }
+      }
+
+      // Handle Player Respawn (3s) & Blinking Invulnerability
+      if (playerState.isDestroyed && currentStatus === 'racing') {
+        playerState.respawnTimer -= dt;
+        if (playerState.respawnTimer <= 0) {
+          playerState.isDestroyed = false;
+          playerState.hp = 100;
+          playerState.lateralOffset = 0;
+          playerState.lateralVelocity = 0;
+          playerState.speed = 32;
+          playerState.invulnerableTimer = 3.0; // 3s blinking invulnerability
+          playerRig.root.visible = true;
+          triggerScoreEvent('RESPAWNED — INVULNERABLE');
+        }
+      }
+      if (playerState.invulnerableTimer > 0) {
+        playerState.invulnerableTimer = Math.max(
+          0,
+          playerState.invulnerableTimer - dt
+        );
+        // Blink player mesh while invulnerable
+        playerRig.root.visible =
+          playerState.invulnerableTimer > 0
+            ? Math.floor(elapsed * 16) % 2 === 0
+            : true;
+      } else if (!playerState.isDestroyed) {
+        playerRig.root.visible = true;
+      }
+
+      if (playerState.hitFlashTimer > 0) {
+        playerState.hitFlashTimer = Math.max(0, playerState.hitFlashTimer - dt);
+        if (playerState.hitFlashTimer <= 0) {
+          playerRig.paintMaterials.forEach((mat) => {
+            mat.emissive.setHex(0x000000);
+            mat.emissiveIntensity = 0;
+          });
+        }
+      }
 
       // Handle Race Countdown Lights (5 red pods -> green GO!)
       if (currentStatus === 'countdown') {
@@ -763,9 +1766,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         }
       }
 
-      // Read Combined Keyboard + Touch Controls
+      // Read Combined Keyboard + Mouse + Touch Controls
       const tc = touchControlsRef.current;
-      const canDrive = currentStatus === 'racing';
+      const canDrive = currentStatus === 'racing' && !playerState.isDestroyed;
 
       const throttleInput =
         canDrive && (keys['KeyW'] || keys['ArrowUp'] || tc.throttle) ? 1 : 0;
@@ -775,12 +1778,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         canDrive && (keys['KeyA'] || keys['ArrowLeft'] || tc.left) ? 1 : 0;
       const rightInput =
         canDrive && (keys['KeyD'] || keys['ArrowRight'] || tc.right) ? 1 : 0;
+      // When Combat Mode is ON, Space/Left-Click fires Machine Gun and Shift fires Nitro; when OFF, Space also fires Nitro
       const wantsNitro =
         canDrive &&
         (keys['ShiftLeft'] ||
           keys['ShiftRight'] ||
-          keys['Space'] ||
+          (!isCombatMode && keys['Space']) ||
           tc.nitro);
+      const wantsMachineGun =
+        canDrive &&
+        isCombatMode &&
+        (keys['Space'] || mouseButtons.left || tc.fireMg);
+      const wantsMissile =
+        canDrive &&
+        isCombatMode &&
+        (keys['KeyF'] || mouseButtons.right || tc.fireMissile);
 
       // Evaluate Player Track Frame
       evaluateTrackFrame(playerState.trackDistance, _playerFrame);
@@ -810,6 +1822,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       let isSlipstreaming = false;
       for (let i = 0; i < rivalsState.length; i++) {
         const rv = rivalsState[i];
+        if (rv.isEliminated) continue;
         const distAhead = rv.trackDistance - playerState.trackDistance;
         if (
           distAhead > 4.5 &&
@@ -840,10 +1853,16 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       // Off-track check
       const absLat = Math.abs(playerState.lateralOffset);
       const isOffTrack = absLat > ROAD_HALF_WIDTH - 0.6;
+      if (isOffTrack) {
+        playerState.cornerClean = false;
+      }
 
-      // Longitudinal Physics
+      const baseTopSpeed = 77.5; // ~279 km/h
+      let isTyreScrubbing = false;
+      let isSliding = false;
+
+      // Longitudinal & Cornering Physics (Shooting never slows the player's car)
       if (currentStatus !== 'paused') {
-        const baseTopSpeed = 77.5; // ~279 km/h
         const boostBonus = isBoosting ? 16.5 : 0; // up to ~338 km/h
         const slipBonus = isSlipstreaming ? 5.5 : 0;
         const offTrackPenalty = isOffTrack ? 26.0 : 0;
@@ -918,13 +1937,117 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         );
         playerState.lateralOffset += playerState.lateralVelocity * dt;
 
-        // Guardrail Clamp & Bounce
+        // 3. Speed Loss When Forcing a Turn (Tyre Scrub & High-Slip Slide Drag)
+        const absSteer = Math.abs(playerState.steerAngle);
+        const speedNorm = Math.abs(playerState.speed) / baseTopSpeed;
+        if (canDrive && absSteer > 0.25 && speedNorm > 0.45 && playerState.speed > 0) {
+          const cornerSeverity =
+            1.0 + Math.abs(_playerFrame.curvature) * 4.2;
+          const scrubFactor =
+            Math.pow(absSteer, 1.85) *
+            THREE.MathUtils.clamp((speedNorm - 0.42) / 0.58, 0, 1) *
+            cornerSeverity;
+          const scrubDecel = scrubFactor * 14.5;
+          playerState.speed = Math.max(12, playerState.speed - scrubDecel * dt);
+          if (scrubFactor > 0.22) {
+            isTyreScrubbing = true;
+          }
+        }
+
+        // Decay post-collision spin yaw over ~1 second & apply extra slide drag while sliding/spun
+        playerState.spinYawVelocity = THREE.MathUtils.damp(
+          playerState.spinYawVelocity,
+          0,
+          2.8,
+          dt
+        );
+        playerState.spinOffsetAngle += playerState.spinYawVelocity * dt;
+        playerState.spinOffsetAngle = THREE.MathUtils.damp(
+          playerState.spinOffsetAngle,
+          0,
+          3.4,
+          dt
+        );
+
+        const maxSlipRad = THREE.MathUtils.degToRad(8);
+        isSliding =
+          canDrive &&
+          (Math.abs(playerState.spinOffsetAngle) > 0.08 ||
+            Math.abs(playerState.spinYawVelocity) > 0.22 ||
+            (Math.abs(playerState.driftAngle) > maxSlipRad * 0.72 &&
+              playerState.speed > 36));
+
+        if (isSliding && playerState.speed > 10) {
+          const slideDrag =
+            9.5 + Math.min(14.0, Math.abs(playerState.spinYawVelocity) * 4.5);
+          playerState.speed = Math.max(8, playerState.speed - slideDrag * dt);
+        }
+
+        // Guardrail Barrier Hit Detection, Sound, Sparks & Bounce
         const guardrailLimit = ROAD_HALF_WIDTH + 0.25;
         if (Math.abs(playerState.lateralOffset) > guardrailLimit) {
-          playerState.lateralOffset =
-            Math.sign(playerState.lateralOffset) * guardrailLimit;
-          playerState.lateralVelocity *= -0.35;
-          playerState.speed *= 0.92;
+          const hitSide = Math.sign(playerState.lateralOffset);
+          playerState.lateralOffset = hitSide * guardrailLimit;
+
+          const wallImpactSpeed =
+            Math.abs(playerState.lateralVelocity) +
+            Math.abs(playerState.speed) * 0.22;
+          const wallSeverity = THREE.MathUtils.clamp(
+            wallImpactSpeed / 26,
+            0.18,
+            1.0
+          );
+
+          playerState.lateralVelocity *= -0.42;
+          playerState.speed *= Math.max(0.68, 0.92 - wallSeverity * 0.18);
+          playerState.cornerClean = false;
+
+          if (playerState.wallHitCooldown <= 0 && Math.abs(playerState.speed) > 6) {
+            playerState.wallHitCooldown = 0.32;
+            soundEngine.playWallHit(wallSeverity);
+            playerState.cameraShakeTimer = 0.22;
+            playerState.cameraShakeIntensity = 0.1 + wallSeverity * 0.18;
+            playerState.spinYawVelocity += -hitSide * wallSeverity * 1.45;
+
+            const penalty = Math.round(60 + wallSeverity * 90);
+            playerState.driftScore = Math.max(
+              0,
+              playerState.driftScore - penalty
+            );
+            triggerScoreEvent(`Barrier Contact -${penalty}`);
+
+            if (isCombatMode) {
+              damagePlayer(Math.round(wallSeverity * 12), 'BARRIER IMPACT');
+            }
+
+            evaluateTrackFrame(playerState.trackDistance, _playerFrame);
+            _carWorldPos
+              .copy(_playerFrame.position)
+              .addScaledVector(_playerFrame.right, playerState.lateralOffset);
+            spawnCollisionSparks(
+              _carWorldPos.x,
+              _carWorldPos.y,
+              _carWorldPos.z,
+              10,
+              wallSeverity
+            );
+          }
+        }
+
+        // Clean Corner Exit Detection & Reward
+        const absCurvature = Math.abs(_playerFrame.curvature);
+        if (canDrive && absCurvature > 0.068 && playerState.speed > 36) {
+          if (!playerState.inCornerZone) {
+            playerState.inCornerZone = true;
+            playerState.cornerClean = !isOffTrack;
+          }
+        } else if (playerState.inCornerZone && absCurvature < 0.028) {
+          if (playerState.cornerClean && !isOffTrack && playerState.speed > 40) {
+            playerState.driftScore += 100;
+            triggerScoreEvent('Clean Corner +100');
+          }
+          playerState.inCornerZone = false;
+          playerState.cornerClean = true;
         }
 
         // Drift Detection & Scoring (Unchanged)
@@ -935,7 +2058,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           (Math.abs(_playerFrame.curvature) > 0.025 || brakeInput > 0);
 
         // Visual slip angle: max 8 degrees, applied only above 70% speed or on gravel
-        const maxSlipRad = THREE.MathUtils.degToRad(8);
         const speedRatio = Math.abs(playerState.speed) / baseTopSpeed;
         const isAbove70PercentSpeed = speedRatio > 0.7;
         let targetDriftAngle = 0;
@@ -986,6 +2108,10 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           if (newLap > prevLap && playerState.trackDistance > TRACK_LENGTH * 0.5) {
             soundEngine.playLapComplete();
             playerState.lastLapTimeMs = playerState.currentLapTimeMs;
+            playerState.missileAmmo = Math.min(
+              playerState.missileMaxAmmo,
+              playerState.missileAmmo + 2
+            );
             if (
               playerState.bestLapTimeMs === null ||
               playerState.currentLapTimeMs < playerState.bestLapTimeMs
@@ -1010,8 +2136,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         .addScaledVector(_playerFrame.right, playerState.lateralOffset);
       playerRig.root.position.copy(_carWorldPos);
 
-      // 1 & 2. Update heading (yaw) from steering input, speed, and direction of travel,
-      // then smoothly interpolate visual rotation toward target heading (rotation.y = heading)
       const speedMoveFactor = THREE.MathUtils.clamp(
         Math.abs(playerState.speed) / 16,
         0,
@@ -1020,7 +2144,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       const yawRateFromSteer = -playerState.steerAngle * speedMoveFactor * 1.55;
       playerState.heading += yawRateFromSteer * dt;
 
-      // Direction of travel vector combining forward spline tangent, lateral velocity, and active steering turn
       const forwardSpeedMag = Math.max(5.0, Math.abs(playerState.speed));
       const steerLateralTurn =
         playerState.steerAngle *
@@ -1044,8 +2167,10 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         dt
       );
 
-      // Smoothly interpolate visual rotation toward target heading + visual slip angle
-      const targetVisualYaw = playerState.heading + playerState.driftAngle;
+      const targetVisualYaw =
+        playerState.heading +
+        playerState.driftAngle +
+        playerState.spinOffsetAngle;
       playerState.visualHeading = dampAngle(
         playerState.visualHeading,
         targetVisualYaw,
@@ -1065,10 +2190,23 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       );
       playerRig.root.rotation.z = 0;
 
-      // 4. Outward Body Roll: tilt car body outward in corners (away from turn center),
-      // proportional to steering and speed (max ~4-6 deg).
-      // In local car space (-Z forward, +X right, +Y up), +rotation.z tilts roof toward -X (left, outside of right turn),
-      // and -rotation.z tilts roof toward +X (right, outside of left turn).
+      // Car forward & right unit vectors along player heading
+      _carForward
+        .set(
+          -Math.sin(playerState.visualHeading),
+          _playerFrame.tangent.y,
+          -Math.cos(playerState.visualHeading)
+        )
+        .normalize();
+      _carRight
+        .set(
+          Math.cos(playerState.visualHeading),
+          0,
+          -Math.sin(playerState.visualHeading)
+        )
+        .normalize();
+
+      // Outward Body Roll
       const maxRollRad = THREE.MathUtils.degToRad(5.4);
       const speedRollFactor = THREE.MathUtils.clamp(
         Math.abs(playerState.speed) / 62,
@@ -1100,7 +2238,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         dt
       );
 
-      // 3. Rotate front wheels by steering angle (~28 deg max, within 25-30 deg) and spin all wheels based on speed
+      // Front wheel steering & spin
       const maxFrontWheelSteerRad = THREE.MathUtils.degToRad(28);
       playerRig.frontWheelPivots.forEach((pivot) => {
         pivot.rotation.y = THREE.MathUtils.damp(
@@ -1128,6 +2266,843 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           isBoosting ? 1.1 : 0.001
         );
       });
+
+      // ============================================================================
+      // FLOATING TRACK PICKUPS: Repair (+30 HP) & Ammo (+Missiles), 15s Respawn
+      // ============================================================================
+      pickupPool.forEach((pk, idx) => {
+        if (!isCombatMode) {
+          pk.group.visible = false;
+          return;
+        }
+
+        if (!pk.active) {
+          if (currentStatus !== 'paused') {
+            pk.respawnTimer -= dt;
+            if (pk.respawnTimer <= 0) {
+              pk.active = true;
+              pk.group.visible = true;
+            }
+          }
+          return;
+        }
+
+        pk.group.visible = true;
+        pk.coreGroup.rotation.y = elapsed * 2.4 + idx * 0.8;
+        pk.coreGroup.position.y =
+          1.05 + Math.sin(elapsed * 3.2 + idx * 1.1) * 0.22;
+
+        // Check pickup collection by Player
+        if (canDrive) {
+          const dx = _carWorldPos.x - pk.basePos.x;
+          const dz = _carWorldPos.z - pk.basePos.z;
+          if (dx * dx + dz * dz < 14.5) {
+            pk.active = false;
+            pk.respawnTimer = 15.0; // Respawn after 15 seconds
+            pk.group.visible = false;
+            soundEngine.playPickup(pk.type);
+            spawnCollisionSparks(
+              pk.basePos.x,
+              pk.basePos.y + 0.8,
+              pk.basePos.z,
+              12,
+              0.65
+            );
+
+            if (pk.type === 'repair') {
+              playerState.hp = Math.min(playerState.maxHp, playerState.hp + 30);
+              triggerScoreEvent('REPAIR PICKUP +30 HP');
+            } else {
+              playerState.missileAmmo = Math.min(
+                playerState.missileMaxAmmo,
+                playerState.missileAmmo + 3
+              );
+              playerState.mgHeat = Math.max(0, playerState.mgHeat - 35);
+              playerState.mgOverheated = false;
+              triggerScoreEvent('AMMO PICKUP +3 MISSILES');
+            }
+          }
+        }
+      });
+
+      // Update 5 AI Rivals, Respawns, Hit Slowdown, Player-vs-AI & AI-vs-AI Collisions
+      let minPackDistance = playerState.trackDistance;
+      for (let i = 0; i < rivalsState.length; i++) {
+        if (!rivalsState[i].isEliminated) {
+          minPackDistance = Math.min(
+            minPackDistance,
+            rivalsState[i].trackDistance
+          );
+        }
+      }
+
+      rivalsState.forEach((rival, idx) => {
+        const rig = rivalRigs[idx];
+
+        if (rival.hitFlashTimer > 0) {
+          rival.hitFlashTimer = Math.max(0, rival.hitFlashTimer - dt);
+          if (rival.hitFlashTimer <= 0) {
+            rig.paintMaterials.forEach((mat) => {
+              mat.emissive.setHex(0x000000);
+              mat.emissiveIntensity = 0;
+            });
+          }
+        }
+
+        // Handle Eliminated Rival Respawn after 5s at back of the pack with 50 HP (disabled if Permanent Elimination is ON)
+        if (rival.isEliminated) {
+          if (currentStatus === 'racing' && !isPermanentElimination) {
+            rival.respawnTimer -= dt;
+            if (rival.respawnTimer <= 0) {
+              rival.isEliminated = false;
+              rival.hp = 50; // Respawn with 50 HP
+              rival.maxHp = 100;
+              rival.trackDistance = Math.max(0, minPackDistance - 26 - idx * 4);
+              rival.lateralOffset = (idx % 2 === 0 ? -1 : 1) * 3.4;
+              rival.targetLateral = rival.lateralOffset;
+              rival.speed = rival.baseMaxSpeed * 0.78;
+              rival.aiReloadTimer = 1.5;
+              rival.aiBurstRemaining = aiDifficultyConfig.burstCount;
+              rig.root.visible = true;
+              evaluateTrackFrame(rival.trackDistance, _rivalFrame);
+              rivalHeadings[idx] = Math.atan2(
+                -_rivalFrame.tangent.x,
+                -_rivalFrame.tangent.z
+              );
+            }
+          }
+          return;
+        }
+
+        evaluateTrackFrame(rival.trackDistance, _rivalFrame);
+
+        if (currentStatus === 'racing' || currentStatus === 'finished') {
+          if (rival.hitSlowTimer > 0) {
+            rival.hitSlowTimer = Math.max(0, rival.hitSlowTimer - dt);
+          }
+
+          const cornerSlowdown = Math.abs(_rivalFrame.curvature) * 65;
+          const distGap = playerState.trackDistance - rival.trackDistance;
+          const rubberBand = THREE.MathUtils.clamp(distGap * 0.08, -5.5, 7.5);
+          const hitSlowFactor = rival.hitSlowTimer > 0 ? 0.72 : 1.0; // Brief 0.5s slowdown when hit
+          const desiredSpeed =
+            (rival.baseMaxSpeed - cornerSlowdown + rubberBand) * hitSlowFactor;
+
+          rival.speed = THREE.MathUtils.damp(
+            rival.speed,
+            desiredSpeed,
+            rival.hitSlowTimer > 0 ? 6.5 : 2.2,
+            dt
+          );
+          rival.trackDistance += rival.speed * dt;
+          rival.lap =
+            Math.max(1, Math.floor(rival.trackDistance / TRACK_LENGTH) + 1);
+
+          if (Math.sin(elapsed * 0.7 + idx * 2.1) > 0.65) {
+            rival.targetLateral =
+              Math.sin(elapsed * 0.35 + idx * 1.9) * (ROAD_HALF_WIDTH * 0.58);
+          }
+          rival.lateralOffset = THREE.MathUtils.damp(
+            rival.lateralOffset,
+            rival.targetLateral,
+            1.8,
+            dt
+          );
+
+          // Player-vs-AI Box/Circle Overlap Collision Detection on XZ / Track Plane
+          if (!playerState.isDestroyed) {
+            const longDiff = rival.trackDistance - playerState.trackDistance;
+            const latDiff = rival.lateralOffset - playerState.lateralOffset;
+            const minLongSep = 4.35;
+            const minLatSep = 2.02;
+
+            if (
+              Math.abs(longDiff) < minLongSep &&
+              Math.abs(latDiff) < minLatSep
+            ) {
+              const latPushSign = latDiff >= 0 ? -1 : 1;
+              const latOverlap = minLatSep - Math.abs(latDiff);
+              playerState.lateralOffset += latPushSign * latOverlap * 0.58;
+              rival.lateralOffset -= latPushSign * latOverlap * 0.42;
+
+              if (Math.abs(longDiff) < 3.4) {
+                const longPushSign = longDiff >= 0 ? -1 : 1;
+                playerState.trackDistance += longPushSign * 0.35;
+                rival.trackDistance -= longPushSign * 0.35;
+              }
+
+              const pairKey = `player_${rival.id}`;
+              if ((collisionCooldowns[pairKey] ?? 0) <= 0) {
+                collisionCooldowns[pairKey] = 0.32;
+
+                const relLongSpeed = Math.abs(playerState.speed - rival.speed);
+                const relLatSpeed = Math.abs(playerState.lateralVelocity);
+                const rawImpact =
+                  (relLongSpeed +
+                    relLatSpeed * 0.7 +
+                    playerState.speed * 0.25) /
+                  42;
+                const impactSeverity = THREE.MathUtils.clamp(
+                  rawImpact,
+                  0.18,
+                  1.0
+                );
+
+                soundEngine.playCarCollision(impactSeverity);
+
+                playerState.lateralVelocity +=
+                  latPushSign * (6.5 + impactSeverity * 9.5);
+                playerState.heading +=
+                  latPushSign * (0.06 + impactSeverity * 0.12);
+
+                if (impactSeverity > 0.52) {
+                  const speedFraction = THREE.MathUtils.lerp(
+                    0.76,
+                    0.54,
+                    (impactSeverity - 0.52) / 0.48
+                  );
+                  playerState.speed *= speedFraction;
+                  rival.speed *= 0.84;
+                  playerState.spinYawVelocity +=
+                    latPushSign * (1.35 + impactSeverity * 1.85);
+                } else {
+                  playerState.speed *= 1.0 - impactSeverity * 0.24;
+                  rival.speed *= 1.0 - impactSeverity * 0.16;
+                  playerState.spinYawVelocity +=
+                    latPushSign * impactSeverity * 0.75;
+                }
+
+                playerState.cameraShakeTimer = 0.28;
+                playerState.cameraShakeIntensity = 0.12 + impactSeverity * 0.26;
+                playerState.cornerClean = false;
+
+                const scorePenalty = Math.round(90 + impactSeverity * 160);
+                playerState.driftScore = Math.max(
+                  0,
+                  playerState.driftScore - scorePenalty
+                );
+                triggerScoreEvent(`Collision -${scorePenalty}`);
+
+                if (isCombatMode) {
+                  damagePlayer(
+                    Math.round(8 + impactSeverity * 14),
+                    rival.driverName
+                  );
+                  damageRival(idx, Math.round(6 + impactSeverity * 12), false);
+                }
+
+                const contactX = (_carWorldPos.x + rig.root.position.x) * 0.5;
+                const contactY = (_carWorldPos.y + rig.root.position.y) * 0.5;
+                const contactZ = (_carWorldPos.z + rig.root.position.z) * 0.5;
+                spawnCollisionSparks(
+                  contactX,
+                  contactY,
+                  contactZ,
+                  14,
+                  impactSeverity
+                );
+              }
+            }
+          }
+
+          // Check Clean Overtake Reward
+          const isNowAhead = rival.trackDistance > playerState.trackDistance;
+          if (
+            rivalWasAhead[idx] &&
+            !isNowAhead &&
+            playerState.trackDistance > 35 &&
+            (collisionCooldowns[`player_${rival.id}`] ?? 0) <= 0 &&
+            !isOffTrack
+          ) {
+            playerState.driftScore += 150;
+            triggerScoreEvent(`Clean Overtake +150`);
+          }
+          rivalWasAhead[idx] = isNowAhead;
+        }
+      });
+
+      // AI-vs-AI Collision Detection & Separation
+      if (currentStatus === 'racing' || currentStatus === 'finished') {
+        for (let i = 0; i < rivalsState.length; i++) {
+          if (rivalsState[i].isEliminated) continue;
+          for (let j = i + 1; j < rivalsState.length; j++) {
+            if (rivalsState[j].isEliminated) continue;
+            const a = rivalsState[i];
+            const b = rivalsState[j];
+            const dLong = b.trackDistance - a.trackDistance;
+            const dLat = b.lateralOffset - a.lateralOffset;
+            if (Math.abs(dLong) < 4.2 && Math.abs(dLat) < 1.95) {
+              const pushSign = dLat >= 0 ? 1 : -1;
+              const overlap = (1.95 - Math.abs(dLat)) * 0.5;
+              a.lateralOffset -= pushSign * overlap;
+              b.lateralOffset += pushSign * overlap;
+              a.targetLateral = THREE.MathUtils.clamp(
+                a.lateralOffset - pushSign * 1.2,
+                -ROAD_HALF_WIDTH * 0.7,
+                ROAD_HALF_WIDTH * 0.7
+              );
+              b.targetLateral = THREE.MathUtils.clamp(
+                b.lateralOffset + pushSign * 1.2,
+                -ROAD_HALF_WIDTH * 0.7,
+                ROAD_HALF_WIDTH * 0.7
+              );
+
+              const aiPairKey = `${a.id}_${b.id}`;
+              if ((collisionCooldowns[aiPairKey] ?? 0) <= 0) {
+                collisionCooldowns[aiPairKey] = 0.3;
+                a.speed *= 0.91;
+                b.speed *= 0.91;
+              }
+            }
+          }
+        }
+      }
+
+      // Update AI Rival 3D Transforms & Smooth Waypoint Orientation
+      rivalsState.forEach((rival, idx) => {
+        if (rival.isEliminated) return;
+        const rig = rivalRigs[idx];
+        evaluateTrackFrame(rival.trackDistance, _rivalFrame);
+        _rivalWorldPos
+          .copy(_rivalFrame.position)
+          .addScaledVector(_rivalFrame.right, rival.lateralOffset);
+        rig.root.position.copy(_rivalWorldPos);
+
+        const waypointLookAhead = 14.0;
+        const nextLateral = THREE.MathUtils.lerp(
+          rival.lateralOffset,
+          rival.targetLateral,
+          0.45
+        );
+        evaluateTrackFrame(
+          rival.trackDistance + waypointLookAhead,
+          _rivalNextFrame
+        );
+        _rivalNextWaypointPos
+          .copy(_rivalNextFrame.position)
+          .addScaledVector(_rivalNextFrame.right, nextLateral);
+
+        _rivalToNext
+          .subVectors(_rivalNextWaypointPos, _rivalWorldPos)
+          .normalize();
+        const targetRivalYaw = Math.atan2(-_rivalToNext.x, -_rivalToNext.z);
+        const prevRivalYaw = rivalHeadings[idx];
+        const smoothedRivalYaw = dampAngle(
+          prevRivalYaw,
+          targetRivalYaw,
+          11.0,
+          dt
+        );
+        rivalHeadings[idx] = smoothedRivalYaw;
+
+        const rivalRoadPitch = Math.asin(
+          THREE.MathUtils.clamp(_rivalFrame.tangent.y, -0.45, 0.45)
+        );
+        rig.root.rotation.y = smoothedRivalYaw;
+        rig.root.rotation.x = THREE.MathUtils.damp(
+          rig.root.rotation.x,
+          rivalRoadPitch,
+          10.0,
+          dt
+        );
+        rig.root.rotation.z = 0;
+
+        let yawDelta = targetRivalYaw - smoothedRivalYaw;
+        yawDelta = ((yawDelta + Math.PI) % (Math.PI * 2)) - Math.PI;
+        const aiSteer = THREE.MathUtils.clamp(
+          -yawDelta * 2.4 + _rivalFrame.curvature * 1.8,
+          -1,
+          1
+        );
+        rig.frontWheelPivots.forEach((pivot) => {
+          pivot.rotation.y = THREE.MathUtils.damp(
+            pivot.rotation.y,
+            -aiSteer * maxFrontWheelSteerRad,
+            12.0,
+            dt
+          );
+        });
+        const aiSpeedRoll = THREE.MathUtils.clamp(rival.speed / 65, 0, 1);
+        rig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(
+          rig.bodyTiltGroup.rotation.z,
+          aiSteer * aiSpeedRoll * THREE.MathUtils.degToRad(4.8),
+          9.0,
+          dt
+        );
+
+        const rSpin = (rival.speed * dt) / 0.35;
+        rig.wheelSpinMeshes.forEach((w) => {
+          w.rotation.x -= rSpin;
+        });
+
+        // AI SHOOTING BACK: Rivals occasionally shoot when player is ahead and in front,
+        // with difficulty-scaled accuracy cone, fire rate, and reload delay between bursts.
+        if (isCombatMode && canDrive && currentStatus === 'racing') {
+          if (rival.aiReloadTimer > 0) {
+            rival.aiReloadTimer = Math.max(0, rival.aiReloadTimer - dt);
+            if (rival.aiReloadTimer <= 0) {
+              rival.aiBurstRemaining = aiDifficultyConfig.burstCount;
+            }
+          } else {
+            const distAhead = playerState.trackDistance - rival.trackDistance;
+            const latDiff = Math.abs(
+              playerState.lateralOffset - rival.lateralOffset
+            );
+
+            // Check if player is ahead on track and within rival's forward cone
+            if (
+              distAhead > 5.0 &&
+              distAhead < aiDifficultyConfig.maxRange &&
+              latDiff < 3.6
+            ) {
+              _toRival.subVectors(_carWorldPos, _rivalWorldPos);
+              const worldDist = _toRival.length();
+              if (worldDist > 3.0) {
+                _toRival.divideScalar(worldDist);
+                const rFwdX = -Math.sin(smoothedRivalYaw);
+                const rFwdZ = -Math.cos(smoothedRivalYaw);
+                const forwardDot = rFwdX * _toRival.x + rFwdZ * _toRival.z;
+
+                if (forwardDot > 0.78) {
+                  rival.aiFireCooldown -= dt;
+                  if (rival.aiFireCooldown <= 0) {
+                    rival.aiFireCooldown = aiDifficultyConfig.burstInterval;
+                    rival.aiBurstRemaining -= 1;
+
+                    if (rival.aiBurstRemaining <= 0) {
+                      rival.aiReloadTimer =
+                        aiDifficultyConfig.reloadDelay *
+                        (0.85 + Math.random() * 0.35);
+                    }
+
+                    // Apply angular inaccuracy based on Easy/Normal/Hard spread
+                    const spread = aiDifficultyConfig.spreadRad;
+                    const errYaw = (Math.random() - 0.5) * 2.0 * spread;
+                    const cosE = Math.cos(errYaw);
+                    const sinE = Math.sin(errYaw);
+                    const dirX = _toRival.x * cosE - _toRival.z * sinE;
+                    const dirZ = _toRival.x * sinE + _toRival.z * cosE;
+                    const dirY =
+                      _toRival.y + (Math.random() - 0.5) * spread * 0.35;
+
+                    const aiMuzzleX = _rivalWorldPos.x + rFwdX * 2.1;
+                    const aiMuzzleY = _rivalWorldPos.y + 0.62;
+                    const aiMuzzleZ = _rivalWorldPos.z + rFwdZ * 2.1;
+
+                    spawnBullet(
+                      false,
+                      idx,
+                      aiMuzzleX,
+                      aiMuzzleY,
+                      aiMuzzleZ,
+                      dirX,
+                      dirY,
+                      dirZ,
+                      rival.speed
+                    );
+                    spawnMuzzleFlash(
+                      aiMuzzleX,
+                      aiMuzzleY,
+                      aiMuzzleZ,
+                      0.85,
+                      0xfb7185
+                    );
+                    if (worldDist < 48) {
+                      soundEngine.playMachineGunShot(0.25);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      // ============================================================================
+      // COMBAT SYSTEM: 8° Aim-Assist Targeting, Machine Gun, Homing Missiles & Smoke
+      // ============================================================================
+      const cos8Deg = Math.cos(THREE.MathUtils.degToRad(8));
+      let bestLockIdx = -1;
+      let bestLockDist = 115; // max lock range in meters
+
+      if (isCombatMode && !playerState.isDestroyed) {
+        for (let i = 0; i < rivalsState.length; i++) {
+          const rv = rivalsState[i];
+          if (rv.isEliminated) continue;
+          const rPos = rivalRigs[i].root.position;
+          _toRival.subVectors(rPos, _carWorldPos);
+          const dist = _toRival.length();
+          if (dist > 3.0 && dist < bestLockDist) {
+            _toRival.divideScalar(dist);
+            const dot = _carForward.dot(_toRival);
+            if (dot >= cos8Deg) {
+              bestLockDist = dist;
+              bestLockIdx = i;
+            }
+          }
+        }
+      }
+      playerState.lockedRivalIdx = bestLockIdx;
+
+      // Update 3D Health Bars & Red Target Lock Bracket above each AI car
+      rivalsState.forEach((rival, idx) => {
+        const hb = rivalHealthBarRigs[idx];
+        if (!isCombatMode || rival.isEliminated) {
+          hb.group.visible = false;
+          hb.lockBox.visible = false;
+          return;
+        }
+        hb.group.visible = true;
+        hb.group.lookAt(camera.position);
+        const hpRatio = THREE.MathUtils.clamp(rival.hp / rival.maxHp, 0.01, 1);
+        hb.fillMesh.scale.x = hpRatio;
+        hb.fillMesh.position.x = -0.52 * (1 - hpRatio);
+        hb.fillMat.color.setHex(
+          hpRatio > 0.5 ? 0x10b981 : hpRatio > 0.3 ? 0xf59e0b : 0xef4444
+        );
+        hb.lockBox.visible = idx === bestLockIdx;
+      });
+
+      if (currentStatus !== 'paused') {
+        // 1. Machine Gun Heat & Firing (4 HP per bullet, fast fire rate, overheat lockout, Muzzle Flash)
+        if (playerState.mgFireTimer > 0) {
+          playerState.mgFireTimer = Math.max(0, playerState.mgFireTimer - dt);
+        }
+
+        if (
+          wantsMachineGun &&
+          !playerState.mgOverheated &&
+          playerState.mgFireTimer <= 0
+        ) {
+          playerState.mgFireTimer = 0.085; // ~11.7 rounds/sec
+          playerState.mgHeat = Math.min(100, playerState.mgHeat + 7.5);
+          if (playerState.mgHeat >= 100) {
+            playerState.mgOverheated = true;
+            triggerScoreEvent('WEAPON OVERHEATED');
+          }
+
+          playerState.mgBarrelToggle *= -1;
+          const muzzleX =
+            _carWorldPos.x +
+            _carForward.x * 2.15 +
+            _carRight.x * (0.52 * playerState.mgBarrelToggle);
+          const muzzleY = _carWorldPos.y + 0.62;
+          const muzzleZ =
+            _carWorldPos.z +
+            _carForward.z * 2.15 +
+            _carRight.z * (0.52 * playerState.mgBarrelToggle);
+
+          // Aim along car heading, or snap within 8-deg aim-assist cone to locked rival
+          if (bestLockIdx >= 0) {
+            const targetPos = rivalRigs[bestLockIdx].root.position;
+            _aimDir
+              .set(
+                targetPos.x - muzzleX,
+                targetPos.y + 0.55 - muzzleY,
+                targetPos.z - muzzleZ
+              )
+              .normalize();
+          } else {
+            _aimDir.copy(_carForward);
+          }
+
+          spawnBullet(
+            true,
+            -1,
+            muzzleX,
+            muzzleY,
+            muzzleZ,
+            _aimDir.x,
+            _aimDir.y,
+            _aimDir.z,
+            Math.max(0, playerState.speed)
+          );
+          spawnMuzzleFlash(muzzleX, muzzleY, muzzleZ, 1.0, 0xfef08a);
+          soundEngine.playMachineGunShot(playerState.mgHeat / 100);
+        } else {
+          const coolRate = playerState.mgOverheated ? 36.0 : 28.0;
+          playerState.mgHeat = Math.max(0, playerState.mgHeat - coolRate * dt);
+          if (playerState.mgOverheated && playerState.mgHeat <= 18) {
+            playerState.mgOverheated = false;
+          }
+        }
+
+        // 2. Homing Missile Firing & Ammo Recharge (35 HP damage, slow fire rate, slight homing)
+        if (playerState.missileCooldown > 0) {
+          playerState.missileCooldown = Math.max(
+            0,
+            playerState.missileCooldown - dt
+          );
+        }
+        if (playerState.missileAmmo < playerState.missileMaxAmmo && canDrive) {
+          playerState.missileRechargeTimer += dt;
+          if (playerState.missileRechargeTimer >= 12.0) {
+            playerState.missileRechargeTimer = 0;
+            playerState.missileAmmo += 1;
+          }
+        }
+
+        if (
+          wantsMissile &&
+          playerState.missileCooldown <= 0 &&
+          playerState.missileAmmo > 0
+        ) {
+          playerState.missileCooldown = 1.15;
+          playerState.missileAmmo -= 1;
+
+          // Find nearest active rival ahead for slight homing
+          let homingIdx = bestLockIdx;
+          if (homingIdx < 0) {
+            let nearestAheadDist = 140;
+            for (let i = 0; i < rivalsState.length; i++) {
+              const rv = rivalsState[i];
+              if (rv.isEliminated) continue;
+              const dAhead = rv.trackDistance - playerState.trackDistance;
+              if (dAhead > 2 && dAhead < nearestAheadDist) {
+                nearestAheadDist = dAhead;
+                homingIdx = i;
+              }
+            }
+          }
+
+          const m = missilePool[missileCursor % MISSILE_POOL_SIZE];
+          missileCursor++;
+          m.active = true;
+          m.x = _carWorldPos.x + _carForward.x * 2.4;
+          m.y = _carWorldPos.y + 0.68;
+          m.z = _carWorldPos.z + _carForward.z * 2.4;
+          const launchSpeed = Math.max(30, playerState.speed) + 78;
+          m.vx = _carForward.x * launchSpeed;
+          m.vy = _carForward.y * launchSpeed;
+          m.vz = _carForward.z * launchSpeed;
+          m.life = 3.2;
+          m.targetIdx = homingIdx;
+          m.smokeTimer = 0;
+          m.group.position.set(m.x, m.y, m.z);
+          m.group.lookAt(
+            m.x + _carForward.x,
+            m.y + _carForward.y,
+            m.z + _carForward.z
+          );
+          m.group.visible = true;
+          spawnMuzzleFlash(m.x, m.y, m.z, 1.45, 0xf97316);
+          soundEngine.playMissileLaunch();
+        }
+
+        // Update Pooled Muzzle Flashes
+        for (let i = 0; i < MUZZLE_FLASH_POOL_SIZE; i++) {
+          const mf = muzzleFlashPool[i];
+          if (!mf.active) continue;
+          mf.timer += dt;
+          if (mf.timer >= mf.duration) {
+            mf.active = false;
+            mf.mesh.visible = false;
+          } else {
+            const p = mf.timer / mf.duration;
+            mf.mesh.scale.setScalar(0.95 * (1 + p * 0.7));
+            mf.mat.opacity = (1 - p) * 0.95;
+          }
+        }
+
+        // Update Pooled Tracer Bullets & Check Hits
+        for (let i = 0; i < BULLET_POOL_SIZE; i++) {
+          const b = bulletPool[i];
+          if (!b.active) continue;
+          b.life -= dt;
+          if (b.life <= 0) {
+            b.active = false;
+            b.mesh.visible = false;
+            continue;
+          }
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+          b.z += b.vz * dt;
+          b.mesh.position.set(b.x, b.y, b.z);
+
+          if (b.isPlayer) {
+            for (let rIdx = 0; rIdx < rivalsState.length; rIdx++) {
+              const rv = rivalsState[rIdx];
+              if (rv.isEliminated) continue;
+              const rPos = rivalRigs[rIdx].root.position;
+              const dx = b.x - rPos.x;
+              const dy = b.y - (rPos.y + 0.6);
+              const dz = b.z - rPos.z;
+              if (dx * dx + dz * dz < 3.6 && Math.abs(dy) < 1.3) {
+                b.active = false;
+                b.mesh.visible = false;
+                damageRival(rIdx, 4, true); // 4 HP per machine gun bullet
+                break;
+              }
+            }
+          } else if (!playerState.isDestroyed) {
+            const dx = b.x - _carWorldPos.x;
+            const dy = b.y - (_carWorldPos.y + 0.6);
+            const dz = b.z - _carWorldPos.z;
+            if (dx * dx + dz * dz < 3.4 && Math.abs(dy) < 1.3) {
+              b.active = false;
+              b.mesh.visible = false;
+              const shooterName =
+                b.ownerIdx >= 0
+                  ? rivalsState[b.ownerIdx].driverName
+                  : 'RIVAL';
+              damagePlayer(4, shooterName);
+              spawnCollisionSparks(b.x, b.y, b.z, 6, 0.4);
+            }
+          }
+        }
+
+        // Update Pooled Homing Missiles & Smoke Trails
+        for (let i = 0; i < MISSILE_POOL_SIZE; i++) {
+          const m = missilePool[i];
+          if (!m.active) continue;
+          m.life -= dt;
+          if (m.life <= 0) {
+            m.active = false;
+            m.group.visible = false;
+            continue;
+          }
+
+          // Slight homing toward target rival ahead
+          if (
+            m.targetIdx >= 0 &&
+            !rivalsState[m.targetIdx].isEliminated
+          ) {
+            const tPos = rivalRigs[m.targetIdx].root.position;
+            _toRival
+              .set(tPos.x - m.x, tPos.y + 0.55 - m.y, tPos.z - m.z)
+              .normalize();
+            const curSpeed = Math.sqrt(
+              m.vx * m.vx + m.vy * m.vy + m.vz * m.vz
+            );
+            _aimDir.set(m.vx, m.vy, m.vz).divideScalar(Math.max(1, curSpeed));
+            _aimDir.lerp(_toRival, 1 - Math.exp(-3.4 * dt)).normalize();
+            m.vx = _aimDir.x * curSpeed;
+            m.vy = _aimDir.y * curSpeed;
+            m.vz = _aimDir.z * curSpeed;
+          }
+
+          m.x += m.vx * dt;
+          m.y += m.vy * dt;
+          m.z += m.vz * dt;
+          m.group.position.set(m.x, m.y, m.z);
+          m.group.lookAt(m.x + m.vx, m.y + m.vy, m.z + m.vz);
+
+          m.smokeTimer += dt;
+          if (m.smokeTimer >= 0.025) {
+            m.smokeTimer = 0;
+            spawnSmokePuff(m.x, m.y, m.z, 0, 0.6, 0, 0.42);
+          }
+
+          // Check missile impact against any active rival (35 HP damage)
+          for (let rIdx = 0; rIdx < rivalsState.length; rIdx++) {
+            const rv = rivalsState[rIdx];
+            if (rv.isEliminated) continue;
+            const rPos = rivalRigs[rIdx].root.position;
+            const dx = m.x - rPos.x;
+            const dy = m.y - (rPos.y + 0.6);
+            const dz = m.z - rPos.z;
+            if (dx * dx + dz * dz < 6.8 && Math.abs(dy) < 1.8) {
+              m.active = false;
+              m.group.visible = false;
+              spawnCollisionSparks(m.x, m.y, m.z, 18, 0.95);
+              damageRival(rIdx, 35, true); // 35 HP per missile
+              break;
+            }
+          }
+        }
+
+        // Continuous Smoke Emission at <= 30% HP for Player and Rivals
+        playerState.damageSmokeTimer += dt;
+        if (playerState.damageSmokeTimer >= 0.05) {
+          playerState.damageSmokeTimer = 0;
+          if (
+            isCombatMode &&
+            !playerState.isDestroyed &&
+            playerState.hp > 0 &&
+            playerState.hp <= 30
+          ) {
+            spawnSmokePuff(
+              _carWorldPos.x - _carForward.x * 1.3,
+              _carWorldPos.y + 0.65,
+              _carWorldPos.z - _carForward.z * 1.3,
+              0,
+              1.5,
+              0,
+              0.65
+            );
+          }
+          for (let i = 0; i < rivalsState.length; i++) {
+            const rv = rivalsState[i];
+            if (isCombatMode && !rv.isEliminated && rv.hp > 0 && rv.hp <= 30) {
+              const rPos = rivalRigs[i].root.position;
+              spawnSmokePuff(rPos.x, rPos.y + 0.65, rPos.z, 0, 1.5, 0, 0.65);
+            }
+          }
+        }
+
+        // Update Pooled Smoke Particles
+        const smokePosAttr = smokeGeo.getAttribute(
+          'position'
+        ) as THREE.BufferAttribute;
+        let smokeActive = false;
+        for (let i = 0; i < smokePoolCount; i++) {
+          if (smokeLifetimes[i] > 0) {
+            smokeActive = true;
+            smokeLifetimes[i] -= dt;
+            if (smokeLifetimes[i] <= 0) {
+              smokePosAttr.setY(i, -999);
+            } else {
+              smokePosAttr.setXYZ(
+                i,
+                smokePosAttr.getX(i) + smokeVelocities[i * 3] * dt,
+                smokePosAttr.getY(i) + smokeVelocities[i * 3 + 1] * dt,
+                smokePosAttr.getZ(i) + smokeVelocities[i * 3 + 2] * dt
+              );
+            }
+          }
+        }
+        if (smokeActive) {
+          smokePosAttr.needsUpdate = true;
+        }
+
+        // Update Pooled Stylized Explosions (Fireball + Shockwave Ring + Debris)
+        for (let i = 0; i < EXPLOSION_POOL_SIZE; i++) {
+          const exp = explosionPool[i];
+          if (!exp.active) continue;
+          exp.timer += dt;
+          const progress = exp.timer / exp.duration;
+          if (progress >= 1) {
+            exp.active = false;
+            exp.fireballMesh.visible = false;
+            exp.ringMesh.visible = false;
+          } else {
+            const fbScale = 0.6 + Math.pow(progress, 0.55) * 5.8;
+            exp.fireballMesh.scale.setScalar(fbScale);
+            exp.fireballMat.opacity = (1 - progress) * 0.92;
+
+            const rgScale = 1.0 + progress * 13.5;
+            exp.ringMesh.scale.setScalar(rgScale);
+            exp.ringMat.opacity = (1 - progress) * 0.88;
+          }
+        }
+
+        for (let i = 0; i < DEBRIS_POOL_SIZE; i++) {
+          const deb = debrisPool[i];
+          if (!deb.active) continue;
+          deb.life -= dt;
+          if (deb.life <= 0) {
+            deb.active = false;
+            deb.mesh.visible = false;
+          } else {
+            deb.mesh.position.x += deb.vx * dt;
+            deb.mesh.position.y += deb.vy * dt;
+            deb.mesh.position.z += deb.vz * dt;
+            deb.vy -= 22.0 * dt;
+            deb.mesh.rotation.x += deb.rx * dt;
+            deb.mesh.rotation.y += deb.ry * dt;
+          }
+        }
+      }
 
       // 1. Speed Wind Particles Update
       particleMat.uniforms.uOpacity.value = THREE.MathUtils.clamp(
@@ -1172,7 +3147,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           'position'
         ) as THREE.BufferAttribute;
         for (let i = 0; i < gravelDustCount; i++) {
-          let gz = gravAttr.getZ(i) + Math.max(12, playerState.speed * 0.45) * dt;
+          let gz =
+            gravAttr.getZ(i) + Math.max(12, playerState.speed * 0.45) * dt;
           let gy = gravAttr.getY(i) + 1.8 * dt;
           if (gz > 10.5) {
             gz = 1.65 + (i % 4) * 0.35;
@@ -1184,127 +3160,29 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         gravAttr.needsUpdate = true;
       }
 
-      // 7. Update 5 AI Rivals & Orient Toward Next Track Waypoint with Smooth Rotation
-      rivalsState.forEach((rival, idx) => {
-        const rig = rivalRigs[idx];
-        evaluateTrackFrame(rival.trackDistance, _rivalFrame);
-
-        if (currentStatus === 'racing' || currentStatus === 'finished') {
-          const cornerSlowdown = Math.abs(_rivalFrame.curvature) * 65;
-          const distGap = playerState.trackDistance - rival.trackDistance;
-          const rubberBand = THREE.MathUtils.clamp(distGap * 0.08, -5.5, 7.5);
-          const desiredSpeed =
-            rival.baseMaxSpeed - cornerSlowdown + rubberBand;
-
-          rival.speed = THREE.MathUtils.damp(
-            rival.speed,
-            desiredSpeed,
-            2.2,
-            dt
-          );
-          rival.trackDistance += rival.speed * dt;
-          rival.lap =
-            Math.max(1, Math.floor(rival.trackDistance / TRACK_LENGTH) + 1);
-
-          if (Math.sin(elapsed * 0.7 + idx * 2.1) > 0.65) {
-            rival.targetLateral =
-              Math.sin(elapsed * 0.35 + idx * 1.9) * (ROAD_HALF_WIDTH * 0.58);
-          }
-          rival.lateralOffset = THREE.MathUtils.damp(
-            rival.lateralOffset,
-            rival.targetLateral,
-            1.8,
-            dt
-          );
-
-          const longDiff = rival.trackDistance - playerState.trackDistance;
-          const latDiff = rival.lateralOffset - playerState.lateralOffset;
-          if (Math.abs(longDiff) < 4.3 && Math.abs(latDiff) < 1.95) {
-            const pushDir = latDiff >= 0 ? -1 : 1;
-            playerState.lateralVelocity += pushDir * 8.5;
-            rival.lateralOffset -= pushDir * 0.6;
-            if (longDiff > 0 && playerState.speed > rival.speed) {
-              rival.speed += 3.5;
-              playerState.speed *= 0.94;
-            }
+      // 4. Update Pooled World-Space Collision Spark Particles
+      const sparkPosAttr = sparkGeo.getAttribute(
+        'position'
+      ) as THREE.BufferAttribute;
+      let sparksActive = false;
+      for (let i = 0; i < sparkPoolCount; i++) {
+        if (sparkLifetimes[i] > 0) {
+          sparksActive = true;
+          sparkLifetimes[i] -= dt;
+          if (sparkLifetimes[i] <= 0) {
+            sparkPosAttr.setY(i, -999);
+          } else {
+            const sx = sparkPosAttr.getX(i) + sparkVelocities[i * 3] * dt;
+            const sy = sparkPosAttr.getY(i) + sparkVelocities[i * 3 + 1] * dt;
+            const sz = sparkPosAttr.getZ(i) + sparkVelocities[i * 3 + 2] * dt;
+            sparkVelocities[i * 3 + 1] -= 14.5 * dt; // gravity on sparks
+            sparkPosAttr.setXYZ(i, sx, sy, sz);
           }
         }
-
-        evaluateTrackFrame(rival.trackDistance, _rivalFrame);
-        _rivalWorldPos
-          .copy(_rivalFrame.position)
-          .addScaledVector(_rivalFrame.right, rival.lateralOffset);
-        rig.root.position.copy(_rivalWorldPos);
-
-        // Evaluate next waypoint along the track spline ahead of the AI car
-        const waypointLookAhead = 14.0;
-        const nextLateral = THREE.MathUtils.lerp(
-          rival.lateralOffset,
-          rival.targetLateral,
-          0.45
-        );
-        evaluateTrackFrame(
-          rival.trackDistance + waypointLookAhead,
-          _rivalNextFrame
-        );
-        _rivalNextWaypointPos
-          .copy(_rivalNextFrame.position)
-          .addScaledVector(_rivalNextFrame.right, nextLateral);
-
-        _rivalToNext
-          .subVectors(_rivalNextWaypointPos, _rivalWorldPos)
-          .normalize();
-        const targetRivalYaw = Math.atan2(-_rivalToNext.x, -_rivalToNext.z);
-        const prevRivalYaw = rivalHeadings[idx];
-        const smoothedRivalYaw = dampAngle(
-          prevRivalYaw,
-          targetRivalYaw,
-          11.0,
-          dt
-        );
-        rivalHeadings[idx] = smoothedRivalYaw;
-
-        const rivalRoadPitch = Math.asin(
-          THREE.MathUtils.clamp(_rivalFrame.tangent.y, -0.45, 0.45)
-        );
-        rig.root.rotation.y = smoothedRivalYaw;
-        rig.root.rotation.x = THREE.MathUtils.damp(
-          rig.root.rotation.x,
-          rivalRoadPitch,
-          10.0,
-          dt
-        );
-        rig.root.rotation.z = 0;
-
-        // AI front wheel steering & outward body roll in corners
-        let yawDelta = targetRivalYaw - smoothedRivalYaw;
-        yawDelta = ((yawDelta + Math.PI) % (Math.PI * 2)) - Math.PI;
-        const aiSteer = THREE.MathUtils.clamp(
-          -yawDelta * 2.4 + _rivalFrame.curvature * 1.8,
-          -1,
-          1
-        );
-        rig.frontWheelPivots.forEach((pivot) => {
-          pivot.rotation.y = THREE.MathUtils.damp(
-            pivot.rotation.y,
-            -aiSteer * maxFrontWheelSteerRad,
-            12.0,
-            dt
-          );
-        });
-        const aiSpeedRoll = THREE.MathUtils.clamp(rival.speed / 65, 0, 1);
-        rig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(
-          rig.bodyTiltGroup.rotation.z,
-          aiSteer * aiSpeedRoll * THREE.MathUtils.degToRad(4.8),
-          9.0,
-          dt
-        );
-
-        const rSpin = (rival.speed * dt) / 0.35;
-        rig.wheelSpinMeshes.forEach((w) => {
-          w.rotation.x -= rSpin;
-        });
-      });
+      }
+      if (sparksActive) {
+        sparkPosAttr.needsUpdate = true;
+      }
 
       // Keep Sunset Key Light (Long Shadows) & Warm Rim Light centered on Player Car
       sunLight.position.set(
@@ -1321,7 +3199,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       );
       rimLight.target.position.copy(_carWorldPos);
 
-      // 6. Camera Choreography: Chase Camera Follows Car's Heading with Increased Smooth Damping + Halved Sideways Offset
+      // 6. Camera Choreography: Chase Camera Follows Car's Heading with Increased Smooth Damping + Halved Sideways Offset + Impact Shake
       const targetFov =
         currentCamMode === 'hood'
           ? 68 + (playerState.speed / 90) * 14
@@ -1329,7 +3207,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 6.0, dt);
       camera.updateProjectionMatrix();
 
-      // Increased heading damping (11.5) so camera tracks car heading more tightly while still showing cornering rotation
       playerState.camHeading = dampAngle(
         playerState.camHeading,
         playerState.heading,
@@ -1348,14 +3225,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           Math.cos(playerState.camHeading),
           0,
           -Math.sin(playerState.camHeading)
-        )
-        .normalize();
-
-      _carForward
-        .set(
-          -Math.sin(playerState.visualHeading),
-          _playerFrame.tangent.y,
-          -Math.cos(playerState.visualHeading)
         )
         .normalize();
 
@@ -1387,7 +3256,6 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         camera.position.copy(_smoothedCamPos);
         camera.lookAt(_smoothedLookAt);
       } else {
-        // Chase camera: lateral offset reduced by half, increased heading damping
         const turnSideOffset =
           (playerState.steerAngle * 0.52 - playerState.driftAngle * 1.05) *
           THREE.MathUtils.clamp(0.35 + speedMoveFactor * 0.65, 0.35, 1.0);
@@ -1410,6 +3278,14 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         _smoothedLookAt.lerp(_desiredLookAt, 1 - Math.exp(-17.0 * dt));
         camera.position.copy(_smoothedCamPos);
         camera.lookAt(_smoothedLookAt);
+      }
+
+      // Apply short physical camera shake on collision impact
+      if (playerState.cameraShakeTimer > 0) {
+        const shakeDecay = playerState.cameraShakeTimer / 0.28;
+        const amp = playerState.cameraShakeIntensity * shakeDecay;
+        camera.position.x += Math.sin(elapsed * 95) * amp;
+        camera.position.y += Math.cos(elapsed * 115) * amp * 0.7;
       }
 
       // Update Sky Dome, Stars & Drifting Clouds
@@ -1448,14 +3324,33 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
       const isCurrentlyDrifting =
         canDrive &&
-        Math.abs(playerState.driftAngle) > 0.11 &&
+        Math.abs(playerState.driftAngle) > 0.08 &&
         playerState.speed > 40;
 
-      // Update Procedural Web Audio Engine
+      const squealIntensity = canDrive
+        ? Math.max(
+            isCurrentlyDrifting ? 0.9 : 0,
+            isSliding ? 1.0 : 0,
+            isTyreScrubbing
+              ? THREE.MathUtils.clamp(
+                  Math.abs(playerState.steerAngle) * 0.75,
+                  0.25,
+                  0.75
+                )
+              : 0
+          )
+        : 0;
+      const gravelIntensity =
+        canDrive && isOffTrack
+          ? THREE.MathUtils.clamp(Math.abs(playerState.speed) / 36, 0, 1)
+          : 0;
+
+      // Update Procedural Web Audio Engine (Engine, Tyre Squeal, Gravel Loop, Nitro)
       soundEngine.updateTelemetry(
         rpm,
         throttleInput,
-        isCurrentlyDrifting,
+        squealIntensity,
+        gravelIntensity,
         isBoosting,
         currentStatus === 'paused' || currentStatus === 'ready'
       );
@@ -1470,6 +3365,64 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       // Throttle React HUD Telemetry Updates (~20 Hz)
       if (elapsed - lastHudEmitTime > 0.05) {
         lastHudEmitTime = elapsed;
+
+        // Project 3D Crosshair ahead of car along heading & Rival Target Overlays to 2D Screen Percentages
+        camera.updateMatrixWorld();
+        _projVec
+          .copy(_carWorldPos)
+          .addScaledVector(_carForward, 32)
+          .addScaledVector(_playerFrame.up, 0.75);
+        _projVec.project(camera);
+        const crosshairScreen = {
+          x: (_projVec.x * 0.5 + 0.5) * 100,
+          y: (-_projVec.y * 0.5 + 0.5) * 100,
+          visible:
+            isCombatMode &&
+            !playerState.isDestroyed &&
+            _projVec.z > -1 &&
+            _projVec.z < 1,
+          hasLock: bestLockIdx >= 0,
+        };
+
+        const rivalOverlays = rivalsState.map((rv, idx) => {
+          if (!isCombatMode || rv.isEliminated) {
+            return {
+              id: rv.id,
+              driverName: rv.driverName,
+              hp: rv.hp,
+              maxHp: rv.maxHp,
+              screenX: 50,
+              screenY: 50,
+              visible: false,
+              isLockedTarget: false,
+              distanceMeters: 999,
+            };
+          }
+          const rPos = rivalRigs[idx].root.position;
+          const dist = rPos.distanceTo(_carWorldPos);
+          _projVec.set(rPos.x, rPos.y + 2.35, rPos.z).project(camera);
+          const inFrustum =
+            dist < 135 &&
+            _projVec.z > 0 &&
+            _projVec.z < 1 &&
+            Math.abs(_projVec.x) <= 0.96 &&
+            Math.abs(_projVec.y) <= 0.92;
+          return {
+            id: rv.id,
+            driverName: rv.driverName,
+            hp: Math.round(rv.hp),
+            maxHp: rv.maxHp,
+            screenX: (_projVec.x * 0.5 + 0.5) * 100,
+            screenY: (-_projVec.y * 0.5 + 0.5) * 100,
+            visible: inFrustum,
+            isLockedTarget: idx === bestLockIdx,
+            distanceMeters: Math.round(dist),
+          };
+        });
+
+        const activeRivalsCount = rivalsState.filter(
+          (r) => !r.isEliminated
+        ).length;
 
         const allStandings = [
           {
@@ -1510,8 +3463,11 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           nitro: Math.round(playerState.nitro),
           isBoosting,
           isDrifting: isCurrentlyDrifting,
+          isTyreScrubbing,
+          isSliding,
           isSlipstreaming,
           isOffTrack,
+          scoreEventLabel: playerState.scoreEventLabel,
           lap: playerState.lap,
           totalLaps: maxLaps,
           position: playerPosIndex + 1,
@@ -1523,6 +3479,24 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           driftScore: playerState.driftScore,
           currentDriftPoints: playerState.currentDriftPoints,
           lapProgress,
+          combatMode: isCombatMode,
+          combatDifficulty: currentDifficulty,
+          permanentElimination: isPermanentElimination,
+          activeRivalsCount,
+          playerHp: Math.round(playerState.hp),
+          playerMaxHp: playerState.maxHp,
+          isPlayerDestroyed: playerState.isDestroyed,
+          playerRespawnTimer: Number(playerState.respawnTimer.toFixed(1)),
+          isPlayerInvulnerable: playerState.invulnerableTimer > 0,
+          mgHeat: Math.round(playerState.mgHeat),
+          mgOverheated: playerState.mgOverheated,
+          missileAmmo: playerState.missileAmmo,
+          missileMaxAmmo: playerState.missileMaxAmmo,
+          missileCooldown: Number(playerState.missileCooldown.toFixed(1)),
+          kills: playerState.kills,
+          killFeed: playerState.killFeed,
+          crosshairScreen,
+          rivalOverlays,
           standings: allStandings.map((item, idx) => ({
             id: item.id,
             driverName: item.driverName,
@@ -1549,6 +3523,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       cancelAnimationFrame(animFrameId);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
+      renderer.domElement.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mouseup', onMouseUp);
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       window.removeEventListener('resize', handleResize);
       renderer.domElement.removeEventListener(
         'webglcontextlost',
@@ -1567,6 +3544,40 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       ambientDustMat.dispose();
       gravelDustGeo.dispose();
       gravelDustMat.dispose();
+      sparkGeo.dispose();
+      sparkMat.dispose();
+      smokeGeo.dispose();
+      smokeMat.dispose();
+      muzzleFlashGeo.dispose();
+      muzzleFlashPool.forEach((mf) => mf.mat.dispose());
+      tracerGeo.dispose();
+      playerTracerMat.dispose();
+      rivalTracerMat.dispose();
+      missileBodyGeo.dispose();
+      missileNoseGeo.dispose();
+      missileFinGeo.dispose();
+      missileFlareGeo.dispose();
+      missileBodyMat.dispose();
+      missileNoseMat.dispose();
+      missileFinMat.dispose();
+      missileFlareMat.dispose();
+      pickupCrossVGeo.dispose();
+      pickupCrossHGeo.dispose();
+      pickupAmmoOctGeo.dispose();
+      pickupRingGeo.dispose();
+      repairPickupMat.dispose();
+      repairRingMat.dispose();
+      ammoPickupMat.dispose();
+      ammoRingMat.dispose();
+      fireballGeo.dispose();
+      shockwaveGeo.dispose();
+      debrisGeo.dispose();
+      debrisMat.dispose();
+      hpBgGeo.dispose();
+      hpBgMat.dispose();
+      hpFillGeo.dispose();
+      lockBoxGeo.dispose();
+      lockBoxMat.dispose();
       composer?.dispose();
       renderer.dispose();
     };

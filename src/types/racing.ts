@@ -4,6 +4,8 @@ export type CameraMode = 'chase' | 'hood' | 'aerial';
 
 export type RaceStatus = 'ready' | 'countdown' | 'racing' | 'paused' | 'finished';
 
+export type CombatDifficulty = 'easy' | 'normal' | 'hard';
+
 export interface CarLivery {
   id: string;
   name: string;
@@ -48,6 +50,34 @@ export interface RivalCarState {
   baseMaxSpeed: number;
   lap: number;
   gapSeconds: number;
+  hp: number;
+  maxHp: number;
+  isEliminated: boolean;
+  respawnTimer: number;
+  hitSlowTimer: number;
+  hitFlashTimer: number;
+  aiFireCooldown: number;
+  aiBurstRemaining: number;
+  aiReloadTimer: number;
+}
+
+export interface KillFeedItem {
+  id: string;
+  message: string;
+  timestamp: number;
+  isPlayerKill: boolean;
+}
+
+export interface RivalScreenOverlay {
+  id: string;
+  driverName: string;
+  hp: number;
+  maxHp: number;
+  screenX: number; // 0..100vw percentage
+  screenY: number; // 0..100vh percentage
+  visible: boolean;
+  isLockedTarget: boolean;
+  distanceMeters: number;
 }
 
 export interface RaceTelemetry {
@@ -59,8 +89,11 @@ export interface RaceTelemetry {
   nitro: number; // 0 to 100
   isBoosting: boolean;
   isDrifting: boolean;
+  isTyreScrubbing: boolean;
+  isSliding: boolean;
   isSlipstreaming: boolean;
   isOffTrack: boolean;
+  scoreEventLabel: string | null;
   lap: number;
   totalLaps: number;
   position: number;
@@ -72,6 +105,25 @@ export interface RaceTelemetry {
   driftScore: number;
   currentDriftPoints: number;
   lapProgress: number; // 0 to 1
+  // Combat Telemetry
+  combatMode: boolean;
+  combatDifficulty: CombatDifficulty;
+  permanentElimination: boolean;
+  activeRivalsCount: number;
+  playerHp: number;
+  playerMaxHp: number;
+  isPlayerDestroyed: boolean;
+  playerRespawnTimer: number;
+  isPlayerInvulnerable: boolean;
+  mgHeat: number; // 0 to 100
+  mgOverheated: boolean;
+  missileAmmo: number;
+  missileMaxAmmo: number;
+  missileCooldown: number;
+  kills: number;
+  killFeed: KillFeedItem[];
+  crosshairScreen: { x: number; y: number; visible: boolean; hasLock: boolean };
+  rivalOverlays: RivalScreenOverlay[];
   standings: {
     id: string;
     driverName: string;
