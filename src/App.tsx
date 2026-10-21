@@ -398,28 +398,28 @@ export default function App() {
           </div>
         )}
 
-        {/* TOP-LEFT COMBAT HUD PANEL & KILL FEED (Never Overlaps Top Bar or Top-Right Minimap) */}
+        {/* TOP-LEFT COMBAT HUD PANEL & KILL FEED (Safe Left Inset + Max-Width, No Overlapping Labels) */}
         {combatMode && (
           <aside
             aria-label="Combat Weapons and Armor Telemetry"
-            className="pointer-events-none absolute top-16 left-4 z-10 w-56 flex flex-col gap-2 select-none"
+            className="pointer-events-none absolute top-16 left-5 sm:left-6 pl-1 z-10 w-64 max-w-[calc(100vw-2.5rem)] flex flex-col gap-2 select-none"
           >
-            <div className="pointer-events-auto rounded-xl bg-[#0B0F19]/90 border border-white/15 p-2.5 shadow-xl space-y-2">
+            <div className="pointer-events-auto rounded-xl bg-[#0B0F19]/92 border border-white/15 p-3.5 shadow-xl space-y-2.5">
               {/* Header: Combat Status & Kill Count */}
-              <div className="flex items-center justify-between border-b border-white/10 pb-1">
-                <span className="text-[10px] font-display font-bold uppercase tracking-wider text-rose-400 flex items-center gap-1">
-                  <Crosshair className="w-3 h-3" />
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-1.5">
+                <span className="text-[10px] font-display font-bold uppercase tracking-wider text-rose-400 flex items-center gap-1.5 shrink-0">
+                  <Crosshair className="w-3.5 h-3.5 shrink-0" />
                   Combat Systems
                 </span>
-                <span className="text-[11px] font-mono-tabular font-bold text-amber-400">
+                <span className="text-[11px] font-mono-tabular font-bold text-amber-400 shrink-0">
                   Kills: {telemetry.kills}
                 </span>
               </div>
 
               {/* Player Hull Health Bar (100 HP) */}
               <div className="space-y-1">
-                <div className="flex justify-between text-[10px] font-mono-tabular">
-                  <span className="text-slate-300">Armor Integrity</span>
+                <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[10px] font-mono-tabular">
+                  <span className="text-slate-300 font-medium">Armor Integrity</span>
                   <span
                     className={
                       telemetry.isPlayerDestroyed
@@ -452,24 +452,27 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Machine Gun Heat Bar */}
-              <div className="space-y-1">
-                <div className="flex justify-between text-[11px] font-mono-tabular">
-                  <span className="text-slate-300 flex items-center gap-1">
-                    <Flame className="w-3 h-3 text-amber-400" />
-                    Vulcan MG (Space/LMB)
+              {/* Machine Gun Heat Bar (Separate sub-line + flex-wrap so "Vulcan MG" and "HEAT" never overlap) */}
+              <div className="space-y-1 pt-0.5">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[11px] font-mono-tabular">
+                  <span className="text-slate-200 font-semibold flex items-center gap-1.5 shrink-0">
+                    <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    Vulcan MG
                   </span>
                   <span
-                    className={
+                    className={`shrink-0 ${
                       telemetry.mgOverheated
                         ? 'text-rose-400 font-bold'
-                        : 'text-amber-300'
-                    }
+                        : 'text-amber-300 font-semibold'
+                    }`}
                   >
                     {telemetry.mgOverheated
                       ? 'OVERHEATED'
                       : `${telemetry.mgHeat}% HEAT`}
                   </span>
+                </div>
+                <div className="text-[9px] font-mono-tabular text-slate-400 leading-none">
+                  Fire: Space / Left Click
                 </div>
                 <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
                   <div
@@ -486,32 +489,39 @@ export default function App() {
               </div>
 
               {/* Homing Missile Ammo Counter */}
-              <div className="pt-0.5 flex items-center justify-between text-[11px] font-mono-tabular">
-                <span className="text-slate-300">Missiles (F / RMB)</span>
-                <div className="flex items-center gap-1">
-                  {Array.from({ length: telemetry.missileMaxAmmo }).map(
-                    (_, idx) => (
-                      <span
-                        key={idx}
-                        className={`w-2 h-3.5 rounded-xs transition-colors ${
-                          idx < telemetry.missileAmmo
-                            ? 'bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.7)]'
-                            : 'bg-white/10'
-                        }`}
-                      />
-                    )
-                  )}
-                  <span className="ml-1 text-white font-bold">
-                    {telemetry.missileAmmo}/{telemetry.missileMaxAmmo}
+              <div className="pt-0.5 space-y-0.5">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] font-mono-tabular">
+                  <span className="text-slate-200 font-semibold shrink-0">
+                    Homing Missiles
                   </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {Array.from({ length: telemetry.missileMaxAmmo }).map(
+                      (_, idx) => (
+                        <span
+                          key={idx}
+                          className={`w-2 h-3.5 rounded-xs transition-colors ${
+                            idx < telemetry.missileAmmo
+                              ? 'bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.7)]'
+                              : 'bg-white/10'
+                          }`}
+                        />
+                      )
+                    )}
+                    <span className="ml-1 text-white font-bold">
+                      {telemetry.missileAmmo}/{telemetry.missileMaxAmmo}
+                    </span>
+                  </div>
+                </div>
+                <div className="text-[9px] font-mono-tabular text-slate-400 leading-none">
+                  Launch: F / Right Click
                 </div>
               </div>
 
               {/* AI Combat Difficulty (Easy / Normal / Hard) & Permanent Elimination Toggle */}
-              <div className="pt-2 border-t border-white/10 space-y-1.5">
-                <div className="flex items-center justify-between text-[10px] font-mono-tabular">
-                  <span className="text-slate-400">AI Difficulty</span>
-                  <div className="flex items-center gap-1">
+              <div className="pt-2 border-t border-white/10 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[10px] font-mono-tabular">
+                  <span className="text-slate-400 shrink-0">AI Difficulty</span>
+                  <div className="flex items-center gap-1 shrink-0">
                     {(['easy', 'normal', 'hard'] as CombatDifficulty[]).map(
                       (diff) => (
                         <button
@@ -531,14 +541,14 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between text-[10px] font-mono-tabular">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[10px] font-mono-tabular">
                   <span className="text-slate-400">
-                    Perm. Elimination ({telemetry.activeRivalsCount}/5 Alive)
+                    Perm. Elim. ({telemetry.activeRivalsCount}/5 Alive)
                   </span>
                   <button
                     type="button"
                     onClick={() => setPermanentElimination((prev) => !prev)}
-                    className={`px-2 py-0.5 rounded font-semibold cursor-pointer transition-colors ${
+                    className={`px-2 py-0.5 rounded font-semibold cursor-pointer transition-colors shrink-0 ${
                       permanentElimination
                         ? 'bg-rose-500/30 border border-rose-400/50 text-rose-200'
                         : 'bg-white/5 text-slate-400 hover:text-white'

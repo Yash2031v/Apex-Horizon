@@ -14,6 +14,11 @@ import {
 
 export const TRACK_LENGTH = 2400; // meters per lap
 export const ROAD_HALF_WIDTH = 11.5; // 23m wide Grand Touring circuit
+export const KERB_WIDTH = 1.0; // painted kerb & outer edge strip width (meters)
+export const PROP_SAFETY_MARGIN = 3.0; // minimum 3m safety margin beyond kerb
+export const MIN_SAFE_PROP_OFFSET =
+  ROAD_HALF_WIDTH + KERB_WIDTH + PROP_SAFETY_MARGIN; // 15.5m minimum centreline clearance
+export const TRACK_BLOOM_LAYER = 1; // selective bloom layer for lamps, gantry neon & boost pads
 
 // Reusable module-scope math vectors to guarantee zero GC in render loop
 const _p0 = new THREE.Vector3();
@@ -40,6 +45,8 @@ export interface BuiltTrack {
   asphaltTexture: THREE.CanvasTexture;
   boostPads: BoostPadZone[];
   gantryLights: THREE.MeshStandardMaterial[];
+  propDebugGroup: THREE.Group;
+  togglePropDebug: () => boolean;
   updateEnvironment: (elapsed: number, cameraPos: THREE.Vector3) => void;
   dispose: () => void;
 }
@@ -48,7 +55,10 @@ export interface BuiltTrack {
  * Evaluates the closed-loop 2400m Grand Touring circuit at distance `s` (in meters).
  * Combines a base oval with multi-harmonic sweeping S-curves, hairpin chicanes, and rolling hills.
  */
-export function getTrackCenterPosition(s: number, target: THREE.Vector3): THREE.Vector3 {
+export function getTrackCenterPosition(
+  s: number,
+  target: THREE.Vector3
+): THREE.Vector3 {
   const normalized = ((s % TRACK_LENGTH) + TRACK_LENGTH) % TRACK_LENGTH;
   const theta = (normalized / TRACK_LENGTH) * Math.PI * 2;
 
@@ -68,27 +78,75 @@ export function getTrackCenterPosition(s: number, target: THREE.Vector3): THREE.
   return target.set(x, y, z);
 }
 
+export const GROUND_FLOOR_Y = -0.45; // Desert canyon floor base elevation just below start/finish straight (y=0)
+
 /**
- * Computes exact terrain/embankment surface Y at a given lateral distance from track center
- * so trackside props and decals sit flush on the shoulder slope or ground floor.
+ * Computes the horizontal unit right normal on the XZ plane from the track's tangent.
+ * Matches crossVectors(tangent, UP) = (-tz, 0, tx) so +1 is always the RIGHT side of the track
+ * and -1 is always the LEFT side of the track.
  */
-function getEmbankmentSurfaceY(
+export function getHorizontalTrackNormal(
+  tangent: THREE.Vector3,
+  outNormal: THREE.Vector3
+): THREE.Vector3 {
+  const tx = tangent.x;
+  const tz = tangent.z;
+  const len = Math.hypot(tx, tz) || 1;
+  return outNormal.set(-tz / len, 0, tx / len);
+}
+
+/**
+ * Computes a pure yaw angle (rotation around the world Y axis, with pitch = 0 and roll = 0)
+ * from the track's tangent projected onto the XZ plane so that a prop's local +Z forward axis
+ * faces directly toward the track centreline (plus an optional yawOffset).
+ */
+export function getTrackYawFacingTrack(
+  tangent: THREE.Vector3,
+  side: number,
+  yawOffset: number = 0
+): number {
+  const tx = tangent.x;
+  const tz = tangent.z;
+  const len = Math.hypot(tx, tz) || 1;
+  // Horizontal outward right normal is (-tz / len, 0, tx / len).
+  // Inward direction toward the track centreline from `side` (+1 right, -1 left) is -side * normalXZ:
+  const inwardX = (side * tz) / len;
+  const inwardZ = (-side * tx) / len;
+  return Math.atan2(inwardX, inwardZ) + yawOffset;
+}
+
+/**
+ * Computes exact terrain / track-edge shoulder surface Y at a given lateral distance from track centreline
+ * so trackside props sit flush on the verge or desert floor without floating or sinking.
+ */
+export function getEmbankmentSurfaceY(
   frame: TrackFrame,
   side: number,
   latDist: number,
-  groundY: number = -18.0
+  groundY: number = GROUND_FLOOR_Y
 ): number {
-  const edgeY =
-    frame.position.y + side * frame.right.y * ROAD_HALF_WIDTH;
-  const skirtOuterLat = ROAD_HALF_WIDTH + 18.0;
+  const edgeY = frame.position.y + side * frame.right.y * ROAD_HALF_WIDTH + 0.04;
+  const vergeOuterLat = ROAD_HALF_WIDTH + 14.5; // 26.0m: wide, gently graded trackside run-off shoulder
+  const slopeMidLat = ROAD_HALF_WIDTH + 26.0; // 37.5m: mid-embankment transition
+  const skirtOuterLat = ROAD_HALF_WIDTH + 46.0; // 57.5m: embankment base blending into desert floor
+
   if (latDist <= ROAD_HALF_WIDTH) {
     return edgeY;
+  }
+  if (latDist <= vergeOuterLat) {
+    const tVerge = (latDist - ROAD_HALF_WIDTH) / 14.5;
+    return THREE.MathUtils.lerp(edgeY - 0.03, edgeY - 0.25, tVerge);
+  }
+  const midY = THREE.MathUtils.lerp(edgeY - 0.25, groundY, 0.45);
+  if (latDist <= slopeMidLat) {
+    const tMid = (latDist - vergeOuterLat) / (slopeMidLat - vergeOuterLat);
+    return THREE.MathUtils.lerp(edgeY - 0.25, midY, tMid);
   }
   if (latDist >= skirtOuterLat) {
     return groundY;
   }
-  const t = (latDist - ROAD_HALF_WIDTH) / 18.0;
-  return THREE.MathUtils.lerp(edgeY - 0.06, groundY, t);
+  const tOuter = (latDist - slopeMidLat) / (skirtOuterLat - slopeMidLat);
+  return THREE.MathUtils.lerp(midY, groundY, tOuter);
 }
 
 /**
@@ -122,6 +180,501 @@ export function evaluateTrackFrame(s: number, outFrame: TrackFrame): void {
     outFrame.right.applyAxisAngle(outFrame.tangent, outFrame.bankAngle);
     outFrame.up.crossVectors(outFrame.right, outFrame.tangent).normalize();
   }
+}
+
+interface TrackSamplePoint {
+  s: number;
+  frame: TrackFrame;
+  normalXZ: THREE.Vector3;
+}
+
+interface RegisteredObjectProp {
+  kind: 'object';
+  name: string;
+  object: THREE.Object3D;
+  inwardRadius: number;
+  yawOffset: number;
+  allowTilt: boolean;
+  groundYOffset: number;
+  localBoxSize: THREE.Vector3;
+}
+
+interface RegisteredInstancedProp {
+  kind: 'instanced';
+  name: string;
+  mesh: THREE.InstancedMesh;
+  companionMesh?: THREE.InstancedMesh;
+  count: number;
+  inwardRadius: number;
+  yawOffsets?: Float32Array;
+  allowTilt: boolean;
+  groundYOffset: number;
+  localBoxSize: THREE.Vector3;
+}
+
+type RegisteredTrackProp = RegisteredObjectProp | RegisteredInstancedProp;
+
+const _refinedFrame: TrackFrame = {
+  position: new THREE.Vector3(),
+  tangent: new THREE.Vector3(),
+  right: new THREE.Vector3(),
+  up: new THREE.Vector3(),
+  bankAngle: 0,
+  curvature: 0,
+};
+const _refinedNormalXZ = new THREE.Vector3();
+
+/**
+ * Finds the exact closest point along the 2400m curved track centreline on the XZ plane
+ * with continuous tangent projection refinement so there is zero discrete sample error on hills or curves.
+ */
+function findClosestTrackSampleXZ(
+  wx: number,
+  wz: number,
+  samples: TrackSamplePoint[]
+): {
+  sample: TrackSamplePoint;
+  distXZ: number;
+  side: number;
+} {
+  let bestIdx = 0;
+  let bestDistSq = Infinity;
+
+  for (let i = 0; i < samples.length; i++) {
+    const dx = wx - samples[i].frame.position.x;
+    const dz = wz - samples[i].frame.position.z;
+    const dSq = dx * dx + dz * dz;
+    if (dSq < bestDistSq) {
+      bestDistSq = dSq;
+      bestIdx = i;
+    }
+  }
+
+  const coarse = samples[bestIdx];
+  const dx0 = wx - coarse.frame.position.x;
+  const dz0 = wz - coarse.frame.position.z;
+  const tx = coarse.frame.tangent.x;
+  const tz = coarse.frame.tangent.z;
+  const tLen = Math.hypot(tx, tz) || 1;
+  const alongS = (dx0 * tx + dz0 * tz) / tLen;
+  const refinedS =
+    (((coarse.s + alongS) % TRACK_LENGTH) + TRACK_LENGTH) % TRACK_LENGTH;
+
+  evaluateTrackFrame(refinedS, _refinedFrame);
+  getHorizontalTrackNormal(_refinedFrame.tangent, _refinedNormalXZ);
+
+  const dx = wx - _refinedFrame.position.x;
+  const dz = wz - _refinedFrame.position.z;
+  const dotRight = dx * _refinedNormalXZ.x + dz * _refinedNormalXZ.z;
+  const side = dotRight >= 0 ? 1 : -1;
+  const distXZ = Math.hypot(dx, dz);
+
+  return {
+    sample: {
+      s: refinedS,
+      frame: _refinedFrame,
+      normalXZ: _refinedNormalXZ,
+    },
+    distXZ,
+    side,
+  };
+}
+
+/**
+ * Computes a curve-validated world position (with base on terrain height) and upright yaw-only quaternion
+ * so every placed prop already satisfies the closest-curve-point check with zero warnings.
+ */
+function computeValidatedPropPlacement(
+  s: number,
+  side: number,
+  desiredLatDist: number,
+  inwardRadius: number,
+  yawOffset: number,
+  groundYOffset: number,
+  trackSamples: TrackSamplePoint[],
+  outFrame: TrackFrame,
+  outNormalXZ: THREE.Vector3,
+  outPos: THREE.Vector3,
+  outQuat: THREE.Quaternion
+): void {
+  const safeLat = Math.max(
+    desiredLatDist,
+    MIN_SAFE_PROP_OFFSET + inwardRadius + 0.35
+  );
+  evaluateTrackFrame(s, outFrame);
+  getHorizontalTrackNormal(outFrame.tangent, outNormalXZ);
+
+  outPos.copy(outFrame.position).addScaledVector(outNormalXZ, side * safeLat);
+
+  const { sample, distXZ, side: actualSide } = findClosestTrackSampleXZ(
+    outPos.x,
+    outPos.z,
+    trackSamples
+  );
+  const minReq = MIN_SAFE_PROP_OFFSET + inwardRadius;
+  const finalDist = distXZ < minReq ? minReq + 0.35 : distXZ;
+
+  if (distXZ < minReq) {
+    outPos.x =
+      sample.frame.position.x + sample.normalXZ.x * actualSide * finalDist;
+    outPos.z =
+      sample.frame.position.z + sample.normalXZ.z * actualSide * finalDist;
+  }
+  outPos.y =
+    getEmbankmentSurfaceY(sample.frame, actualSide, finalDist) + groundYOffset;
+
+  const yaw = getTrackYawFacingTrack(
+    sample.frame.tangent,
+    actualSide,
+    yawOffset
+  );
+  outQuat.setFromAxisAngle(_up, yaw);
+}
+
+/**
+ * One-time load validation and auto-correction pass:
+ * - Verifies every trackside prop's distance from the curved track centreline (accounting for prop inward half-depth).
+ * - Verifies every prop is upright (pitch & roll within 2 degrees of 0 unless allowTilt is true).
+ * - Verifies every prop's base sits on the sampled terrain/track-edge height.
+ * - Logs a warning and auto-corrects any offending prop; rebuilds InstancedMesh matrices using
+ *   a consistent `matrix.compose(position, quaternion, scale)` order and updates `instanceMatrix.needsUpdate`.
+ */
+function validateAndCorrectTracksideProps(
+  registeredProps: RegisteredTrackProp[],
+  trackSamples: TrackSamplePoint[]
+): void {
+  const MAX_ALLOWED_TILT_RAD = THREE.MathUtils.degToRad(2.0);
+  const pos = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  const mat = new THREE.Matrix4();
+  const localUp = new THREE.Vector3();
+
+  for (const prop of registeredProps) {
+    if (prop.kind === 'object') {
+      prop.object.updateMatrixWorld(true);
+      pos.copy(prop.object.position);
+      quat.copy(prop.object.quaternion);
+      scale.copy(prop.object.scale);
+
+      const { sample, distXZ, side } = findClosestTrackSampleXZ(
+        pos.x,
+        pos.z,
+        trackSamples
+      );
+      const minRequiredCenterDist = MIN_SAFE_PROP_OFFSET + prop.inwardRadius;
+      const isTooClose = distXZ < minRequiredCenterDist - 0.05;
+
+      localUp.set(0, 1, 0).applyQuaternion(quat);
+      const tiltRad = Math.acos(THREE.MathUtils.clamp(localUp.y, -1, 1));
+      const isTilted = !prop.allowTilt && tiltRad > MAX_ALLOWED_TILT_RAD;
+
+      const targetDist = isTooClose ? minRequiredCenterDist + 0.25 : distXZ;
+      const expectedY =
+        getEmbankmentSurfaceY(sample.frame, side, targetDist) +
+        prop.groundYOffset;
+      const isFloatingOrSunken = Math.abs(pos.y - expectedY) > 0.15;
+
+      if (isTooClose || isTilted || isFloatingOrSunken) {
+        console.warn(
+          `[TrackPropValidator] Auto-correcting prop "${prop.name}": dist=${distXZ.toFixed(
+            2
+          )}m (min=${minRequiredCenterDist.toFixed(2)}m), tilt=${THREE.MathUtils.radToDeg(
+            tiltRad
+          ).toFixed(1)}°, y=${pos.y.toFixed(2)}m (expected=${expectedY.toFixed(2)}m)`
+        );
+
+        if (isTooClose) {
+          pos.x = sample.frame.position.x + sample.normalXZ.x * side * targetDist;
+          pos.z = sample.frame.position.z + sample.normalXZ.z * side * targetDist;
+        }
+        pos.y = expectedY;
+
+        if (!prop.allowTilt) {
+          const cleanYaw = getTrackYawFacingTrack(
+            sample.frame.tangent,
+            side,
+            prop.yawOffset
+          );
+          quat.setFromAxisAngle(_up, cleanYaw);
+        }
+
+        prop.object.position.copy(pos);
+        prop.object.quaternion.copy(quat);
+        prop.object.scale.copy(scale);
+        prop.object.updateMatrix();
+        prop.object.updateMatrixWorld(true);
+      }
+    } else {
+      let correctedCount = 0;
+      for (let i = 0; i < prop.count; i++) {
+        prop.mesh.getMatrixAt(i, mat);
+        mat.decompose(pos, quat, scale);
+
+        const { sample, distXZ, side } = findClosestTrackSampleXZ(
+          pos.x,
+          pos.z,
+          trackSamples
+        );
+        const scaledInwardRadius =
+          prop.inwardRadius * Math.max(scale.x, scale.z);
+        const minRequiredCenterDist = MIN_SAFE_PROP_OFFSET + scaledInwardRadius;
+        const isTooClose = distXZ < minRequiredCenterDist - 0.05;
+
+        localUp.set(0, 1, 0).applyQuaternion(quat);
+        const tiltRad = Math.acos(THREE.MathUtils.clamp(localUp.y, -1, 1));
+        const isTilted = !prop.allowTilt && tiltRad > MAX_ALLOWED_TILT_RAD;
+
+        const targetDist = isTooClose ? minRequiredCenterDist + 0.25 : distXZ;
+        const expectedY =
+          getEmbankmentSurfaceY(sample.frame, side, targetDist) +
+          prop.groundYOffset;
+        const isFloatingOrSunken = Math.abs(pos.y - expectedY) > 0.15;
+
+        const yawOffset = prop.yawOffsets ? prop.yawOffsets[i] : 0;
+
+        if (isTooClose || isTilted || isFloatingOrSunken) {
+          correctedCount++;
+          if (isTooClose) {
+            pos.x =
+              sample.frame.position.x + sample.normalXZ.x * side * targetDist;
+            pos.z =
+              sample.frame.position.z + sample.normalXZ.z * side * targetDist;
+          }
+          pos.y = expectedY;
+        }
+
+        if (!prop.allowTilt) {
+          const cleanYaw = getTrackYawFacingTrack(
+            sample.frame.tangent,
+            side,
+            yawOffset
+          );
+          quat.setFromAxisAngle(_up, cleanYaw);
+        }
+
+        // Always rebuild InstancedMesh matrix with consistent compose(position, quaternion, scale) order
+        mat.compose(pos, quat, scale);
+        prop.mesh.setMatrixAt(i, mat);
+        if (prop.companionMesh) {
+          prop.companionMesh.setMatrixAt(i, mat);
+        }
+      }
+
+      if (correctedCount > 0) {
+        console.warn(
+          `[TrackPropValidator] Auto-corrected ${correctedCount}/${prop.count} instances in "${prop.name}" to enforce safe offset (>=${MIN_SAFE_PROP_OFFSET}m), upright yaw-only rotation, and terrain ground height.`
+        );
+      }
+
+      prop.mesh.instanceMatrix.needsUpdate = true;
+      prop.mesh.computeBoundingSphere();
+      if (prop.companionMesh) {
+        prop.companionMesh.instanceMatrix.needsUpdate = true;
+        prop.companionMesh.computeBoundingSphere();
+      }
+    }
+  }
+}
+
+/**
+ * Builds the batched debug visualization group (toggled with Key P) showing:
+ * 1. Oriented wireframe bounding box for every prop and InstancedMesh instance (cyan/green)
+ * 2. Local +Z Forward Arrow with arrowhead pointing toward the track (bright yellow/orange)
+ * 3. Local +Y Upright Axis line confirming 0 pitch / 0 roll (bright green) & +X Right Axis (red)
+ * 4. Continuous Left & Right Safe-Offset Boundary Lines at `MIN_SAFE_PROP_OFFSET` (15.5m) along the track
+ */
+function buildPropDebugHelperGroup(
+  registeredProps: RegisteredTrackProp[],
+  trackSamples: TrackSamplePoint[],
+  geometriesToDispose: THREE.BufferGeometry[],
+  materialsToDispose: THREE.Material[]
+): THREE.Group {
+  const debugGroup = new THREE.Group();
+  debugGroup.name = 'TrackPropDebugHelpers';
+  debugGroup.visible = false;
+
+  const positions: number[] = [];
+  const colors: number[] = [];
+
+  const pushSegment = (
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+    r: number,
+    g: number,
+    b: number
+  ) => {
+    positions.push(ax, ay, az, bx, by, bz);
+    colors.push(r, g, b, r, g, b);
+  };
+
+  const pos = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  const mat = new THREE.Matrix4();
+  const c0 = new THREE.Vector3();
+  const c1 = new THREE.Vector3();
+  const corners = Array.from({ length: 8 }, () => new THREE.Vector3());
+
+  const addPropGizmo = (
+    p: THREE.Vector3,
+    q: THREE.Quaternion,
+    s: THREE.Vector3,
+    boxSize: THREE.Vector3,
+    isInstanced: boolean
+  ) => {
+    const hx = Math.max(0.35, boxSize.x * 0.5 * s.x);
+    const hy = Math.max(0.5, boxSize.y * s.y);
+    const hz = Math.max(0.35, boxSize.z * 0.5 * s.z);
+
+    // 8 corners of local bounding box with base at y = 0 and top at y = hy
+    corners[0].set(-hx, 0, -hz).applyQuaternion(q).add(p);
+    corners[1].set(hx, 0, -hz).applyQuaternion(q).add(p);
+    corners[2].set(hx, 0, hz).applyQuaternion(q).add(p);
+    corners[3].set(-hx, 0, hz).applyQuaternion(q).add(p);
+    corners[4].set(-hx, hy, -hz).applyQuaternion(q).add(p);
+    corners[5].set(hx, hy, -hz).applyQuaternion(q).add(p);
+    corners[6].set(hx, hy, hz).applyQuaternion(q).add(p);
+    corners[7].set(-hx, hy, hz).applyQuaternion(q).add(p);
+
+    const br = isInstanced ? 0.13 : 0.98;
+    const bg = isInstanced ? 0.83 : 0.75;
+    const bb = isInstanced ? 0.93 : 0.14;
+
+    // Bottom rectangle
+    for (let k = 0; k < 4; k++) {
+      const a = corners[k];
+      const b = corners[(k + 1) % 4];
+      pushSegment(a.x, a.y, a.z, b.x, b.y, b.z, br, bg, bb);
+    }
+    // Top rectangle
+    for (let k = 0; k < 4; k++) {
+      const a = corners[k + 4];
+      const b = corners[((k + 1) % 4) + 4];
+      pushSegment(a.x, a.y, a.z, b.x, b.y, b.z, br, bg, bb);
+    }
+    // Vertical pillars
+    for (let k = 0; k < 4; k++) {
+      const a = corners[k];
+      const b = corners[k + 4];
+      pushSegment(a.x, a.y, a.z, b.x, b.y, b.z, br, bg, bb);
+    }
+
+    // Axis Helper + Forward Arrow (+Z points toward track)
+    const arrowLen = Math.max(2.2, hz + 1.6);
+    const upLen = Math.max(2.2, hy + 1.0);
+    const rightLen = Math.max(1.4, hx + 0.6);
+
+    // +X Right Axis (Red)
+    c0.set(0, 0.25, 0).applyQuaternion(q).add(p);
+    c1.set(rightLen, 0.25, 0).applyQuaternion(q).add(p);
+    pushSegment(c0.x, c0.y, c0.z, c1.x, c1.y, c1.z, 0.96, 0.25, 0.25);
+
+    // +Y Upright Axis (Green)
+    c1.set(0, upLen, 0).applyQuaternion(q).add(p);
+    pushSegment(p.x, p.y, p.z, c1.x, c1.y, c1.z, 0.15, 0.95, 0.35);
+
+    // +Z Forward Arrow toward Track (Bright Yellow-Cyan with Arrowhead)
+    c0.set(0, 0.45, 0).applyQuaternion(q).add(p);
+    c1.set(0, 0.45, arrowLen).applyQuaternion(q).add(p);
+    pushSegment(c0.x, c0.y, c0.z, c1.x, c1.y, c1.z, 1.0, 0.92, 0.15);
+
+    // Arrowhead barbs
+    const barbLeft = new THREE.Vector3(-0.45, 0.45, arrowLen - 0.65)
+      .applyQuaternion(q)
+      .add(p);
+    const barbRight = new THREE.Vector3(0.45, 0.45, arrowLen - 0.65)
+      .applyQuaternion(q)
+      .add(p);
+    pushSegment(
+      c1.x,
+      c1.y,
+      c1.z,
+      barbLeft.x,
+      barbLeft.y,
+      barbLeft.z,
+      1.0,
+      0.92,
+      0.15
+    );
+    pushSegment(
+      c1.x,
+      c1.y,
+      c1.z,
+      barbRight.x,
+      barbRight.y,
+      barbRight.z,
+      1.0,
+      0.92,
+      0.15
+    );
+  };
+
+  for (const prop of registeredProps) {
+    if (prop.kind === 'object') {
+      addPropGizmo(
+        prop.object.position,
+        prop.object.quaternion,
+        prop.object.scale,
+        prop.localBoxSize,
+        false
+      );
+    } else {
+      for (let i = 0; i < prop.count; i++) {
+        prop.mesh.getMatrixAt(i, mat);
+        mat.decompose(pos, quat, scale);
+        addPropGizmo(pos, quat, scale, prop.localBoxSize, true);
+      }
+    }
+  }
+
+  // Add Left & Right Safe Offset Boundary Lines (15.5m from centreline) around the entire track
+  for (let i = 0; i < trackSamples.length; i++) {
+    const curr = trackSamples[i];
+    const next = trackSamples[(i + 1) % trackSamples.length];
+    for (const side of [-1, 1]) {
+      const y0 =
+        getEmbankmentSurfaceY(curr.frame, side, MIN_SAFE_PROP_OFFSET) + 0.18;
+      const y1 =
+        getEmbankmentSurfaceY(next.frame, side, MIN_SAFE_PROP_OFFSET) + 0.18;
+      const x0 =
+        curr.frame.position.x + curr.normalXZ.x * side * MIN_SAFE_PROP_OFFSET;
+      const z0 =
+        curr.frame.position.z + curr.normalXZ.z * side * MIN_SAFE_PROP_OFFSET;
+      const x1 =
+        next.frame.position.x + next.normalXZ.x * side * MIN_SAFE_PROP_OFFSET;
+      const z1 =
+        next.frame.position.z + next.normalXZ.z * side * MIN_SAFE_PROP_OFFSET;
+      pushSegment(x0, y0, z0, x1, y1, z1, 0.96, 0.25, 0.65);
+    }
+  }
+
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(positions, 3)
+  );
+  lineGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  lineGeo.computeBoundingSphere();
+
+  const lineMat = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.92,
+  });
+
+  const lineSegments = new THREE.LineSegments(lineGeo, lineMat);
+  lineSegments.frustumCulled = false;
+  debugGroup.add(lineSegments);
+
+  geometriesToDispose.push(lineGeo);
+  materialsToDispose.push(lineMat);
+
+  return debugGroup;
 }
 
 /**
@@ -174,19 +727,35 @@ export function buildRacingTrack(
   const geometriesToDispose: THREE.BufferGeometry[] = [];
   const materialsToDispose: THREE.Material[] = [];
   const texturesToDispose: THREE.Texture[] = [];
+  const registeredProps: RegisteredTrackProp[] = [];
 
-  const isMidnight = config.id === 'midnight';
   const isCanyon = config.id === 'canyon';
+  const isMidnight = config.id === 'midnight';
+
+  // Pre-sample 960 points along the 2400m track (2.5m spacing) for fast curve-aware prop validation
+  const sampleCount = 960;
+  const trackSamples: TrackSamplePoint[] = [];
+  for (let i = 0; i < sampleCount; i++) {
+    const s = (i / sampleCount) * TRACK_LENGTH;
+    const sampleFrame: TrackFrame = {
+      position: new THREE.Vector3(),
+      tangent: new THREE.Vector3(),
+      right: new THREE.Vector3(),
+      up: new THREE.Vector3(),
+      bankAngle: 0,
+      curvature: 0,
+    };
+    evaluateTrackFrame(s, sampleFrame);
+    const normalXZ = new THREE.Vector3();
+    getHorizontalTrackNormal(sampleFrame.tangent, normalXZ);
+    trackSamples.push({ s, frame: sampleFrame, normalXZ });
+  }
 
   // ============================================================================
-  // 1. GRADIENT SUNSET SKY DOME, GLOWING HORIZON SUN & DRIFTING CLOUDS + STARS
+  // 1. MULTI-STOP SUNSET SKY DOME (DEEP PURPLE -> PINK/MAGENTA -> WARM ORANGE) & LOW SUN HALO
   // ============================================================================
   const skyDomeGroup = new THREE.Group();
-  group.add(skyDomeGroup);
-
-  const sunDirection = new THREE.Vector3(-0.55, 0.13, -0.82).normalize();
-
-  const skyGeo = new THREE.SphereGeometry(860, 36, 24);
+  const skyGeo = new THREE.SphereGeometry(2600, 48, 32);
   const skyMat = new THREE.ShaderMaterial({
     side: THREE.BackSide,
     depthWrite: false,
@@ -194,270 +763,235 @@ export function buildRacingTrack(
     uniforms: {
       uTopColor: {
         value: new THREE.Color(
-          isCanyon ? '#120724' : isMidnight ? '#03050C' : '#0F243C'
+          isCanyon ? '#1A0B2E' : isMidnight ? '#03050C' : '#0F243C'
         ),
       },
       uMidColor: {
         value: new THREE.Color(
-          isCanyon ? '#7A1C54' : isMidnight ? '#0B1938' : '#254E70'
+          isCanyon ? '#9D2B6B' : isMidnight ? '#091126' : '#1E4E79'
         ),
       },
       uHorizonColor: {
         value: new THREE.Color(
-          isCanyon ? '#FF7B54' : isMidnight ? '#152C5B' : '#7DD3FC'
+          isCanyon ? '#F97316' : isMidnight ? '#0F1E38' : '#F59E0B'
         ),
       },
-      uLowerColor: {
-        value: new THREE.Color(
-          isCanyon ? '#4A1D28' : isMidnight ? '#060A14' : '#1E293B'
-        ),
-      },
-      uSunDir: { value: sunDirection },
       uSunColor: {
         value: new THREE.Color(
-          isCanyon ? '#FFF099' : isMidnight ? '#60A5FA' : '#FFFBEB'
+          isCanyon ? '#FFF0E5' : isMidnight ? '#7DD3FC' : '#FEF3C7'
         ),
+      },
+      uSunGlowColor: {
+        value: new THREE.Color(
+          isCanyon ? '#FB7185' : isMidnight ? '#0284C7' : '#FB923C'
+        ),
+      },
+      uSunDir: {
+        value: new THREE.Vector3(-0.52, 0.135, -0.84).normalize(),
       },
       uTime: { value: 0 },
     },
     vertexShader: `
-      varying vec3 vWorldDir;
+      varying vec3 vWorldOffset;
       void main() {
-        vWorldDir = normalize(position);
+        vWorldOffset = position;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
     fragmentShader: `
-      varying vec3 vWorldDir;
       uniform vec3 uTopColor;
       uniform vec3 uMidColor;
       uniform vec3 uHorizonColor;
-      uniform vec3 uLowerColor;
-      uniform vec3 uSunDir;
       uniform vec3 uSunColor;
+      uniform vec3 uSunGlowColor;
+      uniform vec3 uSunDir;
       uniform float uTime;
-
-      float hash(vec2 p) {
-        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-      }
+      varying vec3 vWorldOffset;
 
       void main() {
-        vec3 dir = normalize(vWorldDir);
-        float h = dir.y;
+        vec3 dir = normalize(vWorldOffset);
+        float h = clamp(dir.y, 0.0, 1.0);
 
-        // Multi-stop sunset gradient: lower ground -> horizon orange/pink -> mid magenta -> deep purple zenith
-        vec3 col = uHorizonColor;
-        if (h >= 0.0) {
-          float t1 = smoothstep(0.0, 0.24, h);
-          float t2 = smoothstep(0.18, 0.72, h);
-          col = mix(uHorizonColor, uMidColor, t1);
-          col = mix(col, uTopColor, t2);
-        } else {
-          col = mix(uHorizonColor, uLowerColor, smoothstep(0.0, -0.25, h));
-        }
+        // Multi-stop sunset gradient: warm orange near horizon -> pink/magenta mid-sky -> deep purple zenith
+        vec3 sky = mix(uHorizonColor, uMidColor, smoothstep(0.0, 0.24, h));
+        sky = mix(sky, uTopColor, smoothstep(0.20, 0.78, h));
 
-        // Warm atmospheric solar glow & soft horizon bloom around low sun
-        float sunAlignment = max(0.0, dot(dir, uSunDir));
-        float sunHalo = pow(sunAlignment, 6.0) * 0.48 + pow(sunAlignment, 36.0) * 0.75;
-        col += uSunColor * sunHalo;
+        float horizonBloom = pow(1.0 - h, 4.8);
+        sky += uSunGlowColor * horizonBloom * 0.16;
 
-        // Faint twinkling stars near top zenith
-        if (h > 0.22) {
-          vec2 starGrid = floor(dir.xz * 260.0);
-          float r = hash(starGrid);
-          if (r > 0.9945) {
-            float twinkle = 0.55 + 0.45 * sin(uTime * 2.4 + r * 90.0);
-            float zenithMask = smoothstep(0.22, 0.58, h);
-            col += vec3(0.95, 0.9, 1.0) * twinkle * zenithMask * 0.85;
-          }
-        }
+        // Low sun with soft halo (clamped below bloom threshold so sky never blows out)
+        float sunCos = max(dot(dir, uSunDir), 0.0);
+        float wideHalo = pow(sunCos, 7.5) * 0.30;
+        float coreHalo = pow(sunCos, 44.0) * 0.42;
+        float sunDisc = smoothstep(0.9983, 0.9995, sunCos);
 
-        gl_FragColor = vec4(col, 1.0);
+        sky += uSunGlowColor * wideHalo;
+        sky += mix(uSunGlowColor, uSunColor, 0.6) * coreHalo;
+        sky = mix(sky, uSunColor * 0.92, sunDisc);
+
+        float cloudBand = smoothstep(0.03, 0.18, h) * (1.0 - smoothstep(0.22, 0.52, h));
+        float w1 = sin(dir.x * 11.0 + dir.z * 7.0 + uTime * 0.015);
+        float w2 = cos(dir.x * 23.0 - dir.z * 16.0 - uTime * 0.01);
+        float wisp = smoothstep(0.15, 0.85, w1 * 0.55 + w2 * 0.45);
+        vec3 cloudLit = mix(uMidColor * 1.05, uSunGlowColor * 0.95, 0.45 + 0.55 * pow(sunCos, 2.0));
+        sky = mix(sky, cloudLit, cloudBand * wisp * 0.22);
+
+        gl_FragColor = vec4(clamp(sky, 0.0, 0.88), 1.0);
       }
     `,
   });
-  const skyMesh = new THREE.Mesh(skyGeo, skyMat);
-  skyDomeGroup.add(skyMesh);
+  const skyDomeMesh = new THREE.Mesh(skyGeo, skyMat);
+  skyDomeGroup.add(skyDomeMesh);
   geometriesToDispose.push(skyGeo);
   materialsToDispose.push(skyMat);
 
-  // Large Glowing Sun Disc + Soft Halo Rings Low on the Horizon
-  const sunDist = 790;
-  const sunPos = sunDirection.clone().multiplyScalar(sunDist);
+  // Soft Billowing Cloud Sprites Ring around the Sky Dome
+  const cloudTexture = createSoftCloudSpriteTexture();
+  texturesToDispose.push(cloudTexture);
 
-  const sunDiscGeo = new THREE.CircleGeometry(isCanyon ? 52 : 34, 32);
-  const sunDiscMat = new THREE.MeshBasicMaterial({
-    color: isCanyon ? 0xfff3b0 : isMidnight ? 0x93c5fd : 0xffffff,
-    fog: false,
-    depthWrite: false,
-  });
-  const sunDiscMesh = new THREE.Mesh(sunDiscGeo, sunDiscMat);
-  sunDiscMesh.position.copy(sunPos);
-  sunDiscMesh.lookAt(0, 0, 0);
-  skyDomeGroup.add(sunDiscMesh);
-  geometriesToDispose.push(sunDiscGeo);
-  materialsToDispose.push(sunDiscMat);
-
-  const sunHaloGeo = new THREE.CircleGeometry(isCanyon ? 135 : 75, 32);
-  const sunHaloMat = new THREE.MeshBasicMaterial({
-    color: isCanyon ? 0xff7b54 : 0x38bdf8,
-    transparent: true,
-    opacity: isCanyon ? 0.34 : 0.18,
-    blending: THREE.AdditiveBlending,
-    fog: false,
-    depthWrite: false,
-  });
-  const sunHaloMesh = new THREE.Mesh(sunHaloGeo, sunHaloMat);
-  sunHaloMesh.position.copy(sunPos).multiplyScalar(0.995);
-  sunHaloMesh.lookAt(0, 0, 0);
-  skyDomeGroup.add(sunHaloMesh);
-  geometriesToDispose.push(sunHaloGeo);
-  materialsToDispose.push(sunHaloMat);
-
-  // Soft, Semi-Transparent Noise-Textured Cloud Sprites (Omitted for Night Scenes)
   const cloudGroup = new THREE.Group();
-  skyDomeGroup.add(cloudGroup);
+  const cloudPlaneGeo = new THREE.PlaneGeometry(540, 175);
+  geometriesToDispose.push(cloudPlaneGeo);
 
-  const dummy = new THREE.Object3D();
-  const tempColor = new THREE.Color();
+  const cloudCount = 26;
+  const sunDirNorm = new THREE.Vector3(-0.52, 0.135, -0.84).normalize();
+  for (let i = 0; i < cloudCount; i++) {
+    const angle = (i / cloudCount) * Math.PI * 2 + (i % 3) * 0.08;
+    const radius = 1750 + (i % 4) * 140;
+    const cx = Math.cos(angle) * radius;
+    const cz = Math.sin(angle) * radius;
+    const cy = 190 + (i % 5) * 62;
 
-  if (!isMidnight) {
-    const cloudSpriteTex = createSoftCloudSpriteTexture();
-    texturesToDispose.push(cloudSpriteTex);
+    const cloudDir = new THREE.Vector3(cx, cy, cz).normalize();
+    const sunAlign = Math.max(0, cloudDir.dot(sunDirNorm));
 
-    const cloudCount = 26;
-    for (let i = 0; i < cloudCount; i++) {
-      const spriteMat = new THREE.SpriteMaterial({
-        map: cloudSpriteTex,
-        color: isCanyon
-          ? i % 2 === 0
-            ? 0xffcba4
-            : 0xf9a8d4
-          : 0xe2e8f0,
-        transparent: true,
-        opacity: isCanyon ? 0.52 : 0.44,
-        depthWrite: false,
-        fog: false,
-      });
-      materialsToDispose.push(spriteMat);
+    const cloudColor = new THREE.Color(
+      isCanyon ? '#6B2D5C' : isMidnight ? '#1E293B' : '#93C5FD'
+    ).lerp(
+      new THREE.Color(isCanyon ? '#FB923C' : '#FDE68A'),
+      0.32 + 0.62 * Math.pow(sunAlign, 1.6)
+    );
 
-      const sprite = new THREE.Sprite(spriteMat);
-      const angle = (i / cloudCount) * Math.PI * 2 + (i % 3) * 0.14;
-      const rad = 520 + (i % 4) * 55;
-      const y = 115 + (i % 5) * 24;
-      sprite.position.set(Math.cos(angle) * rad, y, Math.sin(angle) * rad);
+    const cloudMat = new THREE.MeshBasicMaterial({
+      map: cloudTexture,
+      color: cloudColor,
+      transparent: true,
+      opacity: isMidnight ? 0.16 : 0.36,
+      depthWrite: false,
+      fog: false,
+      side: THREE.DoubleSide,
+    });
+    materialsToDispose.push(cloudMat);
 
-      const width = 135 + (i % 5) * 32;
-      const height = width * 0.46;
-      sprite.scale.set(width, height, 1);
-      cloudGroup.add(sprite);
-    }
+    const cloudMesh = new THREE.Mesh(cloudPlaneGeo, cloudMat);
+    cloudMesh.position.set(cx, cy, cz);
+    cloudMesh.lookAt(0, cy * 0.7, 0);
+    const scaleX = 0.85 + (i % 4) * 0.35;
+    const scaleY = 0.7 + (i % 3) * 0.25;
+    cloudMesh.scale.set(scaleX, scaleY, 1);
+    cloudGroup.add(cloudMesh);
   }
+  skyDomeGroup.add(cloudGroup);
+  group.add(skyDomeGroup);
 
   // ============================================================================
-  // 2. MOUNTAIN SILHOUETTES (3 LAYERS: FARTHER LAYERS LIGHTER WITH ATMOSPHERIC HAZE + MOONLIGHT RIM)
+  // 2. LAYERED DISTANT CANYON MOUNTAIN RINGS WITH MATCHING SUNSET HAZE & RIM LIGHT
   // ============================================================================
-  const hazeColor = new THREE.Color(
-    isCanyon ? '#C0565B' : isMidnight ? '#1E3A6D' : '#4E7396'
-  );
-  const moonRimColor = new THREE.Color(
-    isCanyon ? '#E2D4F0' : isMidnight ? '#BAE6FD' : '#E0F2FE'
-  );
-  const moonDir = new THREE.Vector3(0.48, 0.62, 0.62).normalize();
-
-  // Farther layers have higher hazeFactor so they appear progressively lighter & hazier
   const horizonLayers = [
     {
-      radius: 565,
-      height: 88,
-      variance: 36,
-      baseColor: isCanyon ? '#260E22' : isMidnight ? '#060B16' : '#0E1A2B',
-      hazeFactor: 0.14,
-      rimStrength: 0.36,
+      radius: 1080,
+      height: 155,
+      variance: 58,
       seed: 1.1,
+      baseHex: isCanyon ? '#4A2538' : isMidnight ? '#0B1325' : '#1E3A5F',
+      hazeHex: isCanyon ? '#D96B43' : isMidnight ? '#111C35' : '#64748B',
+      rimHex: isCanyon ? '#FDBA74' : isMidnight ? '#38BDF8' : '#FDE68A',
+      hazeStrength: 0.36,
     },
     {
-      radius: 675,
-      height: 124,
-      variance: 48,
-      baseColor: isCanyon ? '#3D1731' : isMidnight ? '#0C162B' : '#182C44',
-      hazeFactor: 0.42,
-      rimStrength: 0.28,
+      radius: 1460,
+      height: 230,
+      variance: 88,
       seed: 2.7,
+      baseHex: isCanyon ? '#331A38' : isMidnight ? '#080E1C' : '#172554',
+      hazeHex: isCanyon ? '#C85A48' : isMidnight ? '#0F172A' : '#475569',
+      rimHex: isCanyon ? '#FB7185' : isMidnight ? '#0284C7' : '#FBBF24',
+      hazeStrength: 0.58,
     },
     {
-      radius: 785,
-      height: 162,
-      variance: 62,
-      baseColor: isCanyon ? '#592342' : isMidnight ? '#142442' : '#24405E',
-      hazeFactor: 0.68,
-      rimStrength: 0.22,
-      seed: 4.3,
+      radius: 1880,
+      height: 310,
+      variance: 120,
+      seed: 4.4,
+      baseHex: isCanyon ? '#1F102E' : isMidnight ? '#050811' : '#0F172A',
+      hazeHex: isCanyon ? '#9D2B6B' : isMidnight ? '#090D16' : '#334155',
+      rimHex: isCanyon ? '#F97316' : isMidnight ? '#0369A1' : '#F59E0B',
+      hazeStrength: 0.78,
     },
   ];
 
   horizonLayers.forEach((layer) => {
-    const wallGeo = createCanyonHorizonRingGeometry(
+    const ringGeo = createCanyonHorizonRingGeometry(
       layer.radius,
       layer.height,
       layer.variance,
       layer.seed
     );
-    const wallMat = new THREE.ShaderMaterial({
+    const ringMat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
+      depthWrite: true,
       fog: false,
       uniforms: {
-        uBaseColor: { value: new THREE.Color(layer.baseColor) },
-        uHazeColor: { value: hazeColor },
-        uMoonRimColor: { value: moonRimColor },
-        uMoonDir: { value: moonDir },
-        uHazeFactor: { value: layer.hazeFactor },
-        uRimStrength: { value: layer.rimStrength },
+        uBaseColor: { value: new THREE.Color(layer.baseHex) },
+        uHazeColor: { value: new THREE.Color(layer.hazeHex) },
+        uRimColor: { value: new THREE.Color(layer.rimHex) },
+        uSunDir: { value: sunDirNorm },
+        uHazeStrength: { value: layer.hazeStrength },
       },
       vertexShader: `
         varying vec2 vUv;
-        varying vec3 vWorldNormal;
+        varying vec3 vWorldDir;
         void main() {
           vUv = uv;
-          vWorldNormal = normalize(mat3(modelMatrix) * (-normal));
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          vec4 worldPos = modelMatrix * vec4(position, 1.0);
+          vWorldDir = normalize(worldPos.xyz);
+          gl_Position = projectionMatrix * viewMatrix * worldPos;
         }
       `,
       fragmentShader: `
-        varying vec2 vUv;
-        varying vec3 vWorldNormal;
         uniform vec3 uBaseColor;
         uniform vec3 uHazeColor;
-        uniform vec3 uMoonRimColor;
-        uniform vec3 uMoonDir;
-        uniform float uHazeFactor;
-        uniform float uRimStrength;
+        uniform vec3 uRimColor;
+        uniform vec3 uSunDir;
+        uniform float uHazeStrength;
+        varying vec2 vUv;
+        varying vec3 vWorldDir;
 
         void main() {
-          // Blend mountain silhouette with atmospheric haze (farther layers lighter)
-          // Extra vertical haze near the lower valley floor
-          float baseHaze = mix(uHazeFactor + 0.18, uHazeFactor, smoothstep(0.0, 0.65, vUv.y));
-          vec3 col = mix(uBaseColor, uHazeColor, clamp(baseHaze, 0.0, 0.85));
+          float sunAlign = max(dot(normalize(vec3(vWorldDir.x, 0.0, vWorldDir.z)), normalize(vec3(uSunDir.x, 0.0, uSunDir.z))), 0.0);
+          float strata = 0.92 + 0.08 * sin(vUv.y * 42.0);
+          vec3 rockCol = uBaseColor * strata;
 
-          // Subtle moonlight rim lighting along the upper jagged mountain ridge crest
-          float crestMask = smoothstep(0.76, 0.99, vUv.y);
-          float moonFacing = 0.45 + 0.55 * max(0.0, dot(normalize(vWorldNormal), uMoonDir));
-          float rim = pow(crestMask, 2.2) * moonFacing * uRimStrength;
-          col += uMoonRimColor * rim;
+          float bottomHaze = pow(1.0 - clamp(vUv.y, 0.0, 1.0), 1.7);
+          vec3 col = mix(rockCol, uHazeColor, clamp(bottomHaze * 0.75 + uHazeStrength * 0.5, 0.0, 0.92));
 
-          gl_FragColor = vec4(col, 1.0);
+          float crestMask = smoothstep(0.62, 0.98, vUv.y);
+          float rimStrength = crestMask * (0.25 + 0.75 * pow(sunAlign, 2.2));
+          col = mix(col, uRimColor, rimStrength * 0.55);
+
+          gl_FragColor = vec4(clamp(col, 0.0, 0.85), 1.0);
         }
       `,
     });
-    const wallMesh = new THREE.Mesh(wallGeo, wallMat);
-    wallMesh.position.y = layer.height * 0.28 - 18;
-    group.add(wallMesh);
-    geometriesToDispose.push(wallGeo);
-    materialsToDispose.push(wallMat);
+
+    const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+    skyDomeGroup.add(ringMesh);
+    geometriesToDispose.push(ringGeo);
+    materialsToDispose.push(ringMat);
   });
 
   // ============================================================================
-  // 3. TEXTURED SAND/DIRT GROUND WITH NOISE, GRAVEL PATCHES & CONTROLLED SHEEN
+  // 3. PROCEDURAL TEXTURES, DESERT FLOOR, GRAVEL PATCHES & RIBBON ROAD
   // ============================================================================
   const asphaltTexture = createAsphaltTexture(
     maxAnisotropy,
@@ -474,6 +1008,7 @@ export function buildRacingTrack(
   const gravelPatchTexture = createGravelPatchDecalTexture(maxAnisotropy);
   const sandstoneTexture = createSandstoneBandedTexture(maxAnisotropy);
   const skidPatchTexture = createTireSkidPatchTexture(maxAnisotropy);
+
   texturesToDispose.push(
     asphaltTexture,
     groundSandTexture,
@@ -483,8 +1018,8 @@ export function buildRacingTrack(
     skidPatchTexture
   );
 
-  // Textured Ground Terrain Plane with Subtle Moonlit Sheen (No Clearcoat Hotspot Glare)
-  const groundGeo = new THREE.PlaneGeometry(3600, 3600, 1, 1);
+  // Expansive Desert Floor with Subtle Sand Ripples & Specular Sheen
+  const groundGeo = new THREE.PlaneGeometry(5200, 5200);
   groundGeo.rotateX(-Math.PI / 2);
   const groundMat = new THREE.MeshStandardMaterial({
     map: groundSandTexture,
@@ -493,13 +1028,13 @@ export function buildRacingTrack(
     metalness: 0.06,
   });
   const groundMesh = new THREE.Mesh(groundGeo, groundMat);
-  groundMesh.position.y = -18;
+  groundMesh.position.y = GROUND_FLOOR_Y;
   groundMesh.receiveShadow = true;
   group.add(groundMesh);
   geometriesToDispose.push(groundGeo);
   materialsToDispose.push(groundMat);
 
-  // Closed-Loop 3D Ribbon Road & Textured Sand Embankment Skirt
+  // Closed-Loop 3D Ribbon Road, Gravel Run-Off Shoulder Apron, Embankment Skirt & Continuous Guardrail Beam
   const segments = 480;
   const roadPositions: number[] = [];
   const roadNormals: number[] = [];
@@ -511,6 +1046,15 @@ export function buildRacingTrack(
   const skirtUvs: number[] = [];
   const skirtIndices: number[] = [];
 
+  const apronPositions: number[] = [];
+  const apronNormals: number[] = [];
+  const apronUvs: number[] = [];
+  const apronIndices: number[] = [];
+
+  const railPositions: number[] = [];
+  const railNormals: number[] = [];
+  const railIndices: number[] = [];
+
   const frame: TrackFrame = {
     position: new THREE.Vector3(),
     tangent: new THREE.Vector3(),
@@ -519,15 +1063,30 @@ export function buildRacingTrack(
     bankAngle: 0,
     curvature: 0,
   };
+  const normalXZ = new THREE.Vector3();
 
   const leftEdge = new THREE.Vector3();
   const rightEdge = new THREE.Vector3();
+  const leftTuckedEdge = new THREE.Vector3();
+  const rightTuckedEdge = new THREE.Vector3();
+  const leftVergeOuter = new THREE.Vector3();
+  const rightVergeOuter = new THREE.Vector3();
+  const leftSlopeMid = new THREE.Vector3();
+  const rightSlopeMid = new THREE.Vector3();
   const leftSkirtBottom = new THREE.Vector3();
   const rightSkirtBottom = new THREE.Vector3();
+
+  const leftApronInner = new THREE.Vector3();
+  const leftApronOuter = new THREE.Vector3();
+  const rightApronInner = new THREE.Vector3();
+  const rightApronOuter = new THREE.Vector3();
+
+  const railLatDist = MIN_SAFE_PROP_OFFSET + 0.55; // 16.05m from centreline (aligned with guardrail posts)
 
   for (let i = 0; i <= segments; i++) {
     const s = (i / segments) * TRACK_LENGTH;
     evaluateTrackFrame(s, frame);
+    getHorizontalTrackNormal(frame.tangent, normalXZ);
 
     leftEdge.copy(frame.position).addScaledVector(frame.right, -ROAD_HALF_WIDTH);
     rightEdge.copy(frame.position).addScaledVector(frame.right, ROAD_HALF_WIDTH);
@@ -545,67 +1104,241 @@ export function buildRacingTrack(
     roadUvs.push(0, v);
     roadUvs.push(1, v);
 
-    // Embankment shoulders sloping down to desert floor
+    // Tucked inner embankment edges 25cm under the road ribbon so banked turns never expose a seam
+    leftTuckedEdge
+      .copy(frame.position)
+      .addScaledVector(frame.right, -(ROAD_HALF_WIDTH - 0.25));
+    leftTuckedEdge.y = leftEdge.y - 0.03;
+
+    rightTuckedEdge
+      .copy(frame.position)
+      .addScaledVector(frame.right, ROAD_HALF_WIDTH - 0.25);
+    rightTuckedEdge.y = rightEdge.y - 0.03;
+
+    // Wide 14.5m trackside run-off shoulder plateau (lat = 26.0m) where barriers, poles, and props sit
+    const vergeLat = ROAD_HALF_WIDTH + 14.5;
+    leftVergeOuter
+      .copy(frame.position)
+      .addScaledVector(normalXZ, -vergeLat);
+    leftVergeOuter.y = getEmbankmentSurfaceY(frame, -1, vergeLat);
+
+    rightVergeOuter
+      .copy(frame.position)
+      .addScaledVector(normalXZ, vergeLat);
+    rightVergeOuter.y = getEmbankmentSurfaceY(frame, 1, vergeLat);
+
+    // Mid-slope embankment transition (lat = 37.5m)
+    const midLat = ROAD_HALF_WIDTH + 26.0;
+    leftSlopeMid
+      .copy(frame.position)
+      .addScaledVector(normalXZ, -midLat);
+    leftSlopeMid.y = getEmbankmentSurfaceY(frame, -1, midLat);
+
+    rightSlopeMid
+      .copy(frame.position)
+      .addScaledVector(normalXZ, midLat);
+    rightSlopeMid.y = getEmbankmentSurfaceY(frame, 1, midLat);
+
+    // Outer embankment base meeting the desert canyon floor (lat = 57.5m, y = GROUND_FLOOR_Y)
+    const outerLat = ROAD_HALF_WIDTH + 46.0;
     leftSkirtBottom
       .copy(frame.position)
-      .addScaledVector(frame.right, -(ROAD_HALF_WIDTH + 18));
-    leftSkirtBottom.y = -18.2;
+      .addScaledVector(normalXZ, -outerLat);
+    leftSkirtBottom.y = GROUND_FLOOR_Y;
 
     rightSkirtBottom
       .copy(frame.position)
-      .addScaledVector(frame.right, ROAD_HALF_WIDTH + 18);
-    rightSkirtBottom.y = -18.2;
+      .addScaledVector(normalXZ, outerLat);
+    rightSkirtBottom.y = GROUND_FLOOR_Y;
 
+    // 8-vertex cross-section ordered strictly from Left (-normalXZ) to Right (+normalXZ)
     skirtPositions.push(
       leftSkirtBottom.x,
       leftSkirtBottom.y,
       leftSkirtBottom.z,
-      leftEdge.x,
-      leftEdge.y - 0.06,
-      leftEdge.z,
-      rightEdge.x,
-      rightEdge.y - 0.06,
-      rightEdge.z,
+      leftSlopeMid.x,
+      leftSlopeMid.y,
+      leftSlopeMid.z,
+      leftVergeOuter.x,
+      leftVergeOuter.y,
+      leftVergeOuter.z,
+      leftTuckedEdge.x,
+      leftTuckedEdge.y,
+      leftTuckedEdge.z,
+      rightTuckedEdge.x,
+      rightTuckedEdge.y,
+      rightTuckedEdge.z,
+      rightVergeOuter.x,
+      rightVergeOuter.y,
+      rightVergeOuter.z,
+      rightSlopeMid.x,
+      rightSlopeMid.y,
+      rightSlopeMid.z,
       rightSkirtBottom.x,
       rightSkirtBottom.y,
       rightSkirtBottom.z
     );
 
-    const sv = (i / segments) * 60;
-    skirtUvs.push(0, sv, 0.3, sv, 0.7, sv, 1, sv);
+    // Scale UVs to match groundSandTexture.repeat (42x42) so texel density is crisp and seamless
+    const sv = (i / segments) * 1.6;
+    skirtUvs.push(
+      0.0,
+      sv,
+      0.08,
+      sv,
+      0.16,
+      sv,
+      0.23,
+      sv,
+      0.27,
+      sv,
+      0.34,
+      sv,
+      0.42,
+      sv,
+      0.5,
+      sv
+    );
 
-    for (let k = 0; k < 4; k++) {
+    for (let k = 0; k < 8; k++) {
       skirtNormals.push(0, 1, 0);
     }
+
+    // Dedicated Gravel Run-Off Shoulder Apron immediately bordering the outer kerbs (11.35m to 16.25m)
+    const apronOuterLat = MIN_SAFE_PROP_OFFSET + 0.75; // 16.25m
+    leftApronInner
+      .copy(frame.position)
+      .addScaledVector(frame.right, -(ROAD_HALF_WIDTH - 0.15));
+    leftApronInner.y = leftEdge.y - 0.015;
+
+    leftApronOuter
+      .copy(frame.position)
+      .addScaledVector(normalXZ, -apronOuterLat);
+    leftApronOuter.y = getEmbankmentSurfaceY(frame, -1, apronOuterLat) + 0.018;
+
+    rightApronInner
+      .copy(frame.position)
+      .addScaledVector(frame.right, ROAD_HALF_WIDTH - 0.15);
+    rightApronInner.y = rightEdge.y - 0.015;
+
+    rightApronOuter
+      .copy(frame.position)
+      .addScaledVector(normalXZ, apronOuterLat);
+    rightApronOuter.y = getEmbankmentSurfaceY(frame, 1, apronOuterLat) + 0.018;
+
+    apronPositions.push(
+      leftApronOuter.x,
+      leftApronOuter.y,
+      leftApronOuter.z,
+      leftApronInner.x,
+      leftApronInner.y,
+      leftApronInner.z,
+      rightApronInner.x,
+      rightApronInner.y,
+      rightApronInner.z,
+      rightApronOuter.x,
+      rightApronOuter.y,
+      rightApronOuter.z
+    );
+    const av = (i / segments) * 2.4;
+    apronUvs.push(0, av, 0.08, av, 0, av, 0.08, av);
+    for (let k = 0; k < 4; k++) {
+      apronNormals.push(0, 1, 0);
+    }
+
+    // Continuous 3D Steel W-Beam Guardrail Ribbon on Left & Right Roadsides (at lat = 16.05m)
+    const leftRailBaseY = getEmbankmentSurfaceY(frame, -1, railLatDist);
+    const rightRailBaseY = getEmbankmentSurfaceY(frame, 1, railLatDist);
+    const lx = frame.position.x - normalXZ.x * railLatDist;
+    const lz = frame.position.z - normalXZ.z * railLatDist;
+    const rx = frame.position.x + normalXZ.x * railLatDist;
+    const rz = frame.position.z + normalXZ.z * railLatDist;
+
+    // 4 vertices per segment: Left bottom (0), Left top (1), Right bottom (2), Right top (3)
+    railPositions.push(
+      lx,
+      leftRailBaseY + 0.44,
+      lz,
+      lx,
+      leftRailBaseY + 0.78,
+      lz,
+      rx,
+      rightRailBaseY + 0.44,
+      rz,
+      rx,
+      rightRailBaseY + 0.78,
+      rz
+    );
+    // Inward-facing normals toward the track
+    railNormals.push(
+      normalXZ.x,
+      0.15,
+      normalXZ.z,
+      normalXZ.x,
+      0.15,
+      normalXZ.z,
+      -normalXZ.x,
+      0.15,
+      -normalXZ.z,
+      -normalXZ.x,
+      0.15,
+      -normalXZ.z
+    );
 
     if (i < segments) {
       const rBase = i * 2;
       roadIndices.push(rBase, rBase + 1, rBase + 2);
       roadIndices.push(rBase + 1, rBase + 3, rBase + 2);
 
-      const sBase = i * 4;
-      for (let col = 0; col < 3; col++) {
+      const sBase = i * 8;
+      for (let col = 0; col < 7; col++) {
+        // Skip the centre road strip (col === 3) so skirt covers the left and right shoulders/embankments
+        if (col === 3) continue;
         const a = sBase + col;
         const b = sBase + col + 1;
-        const c = sBase + 4 + col;
-        const d = sBase + 4 + col + 1;
+        const c = sBase + 8 + col;
+        const d = sBase + 8 + col + 1;
         skirtIndices.push(a, b, c);
         skirtIndices.push(b, d, c);
       }
+
+      const aBase = i * 4;
+      for (const col of [0, 2]) {
+        const a = aBase + col;
+        const b = aBase + col + 1;
+        const c = aBase + 4 + col;
+        const d = aBase + 4 + col + 1;
+        apronIndices.push(a, b, c);
+        apronIndices.push(b, d, c);
+      }
+
+      const rlBase = i * 4;
+      // Left rail strip (vertices 0, 1)
+      railIndices.push(rlBase + 0, rlBase + 1, rlBase + 4);
+      railIndices.push(rlBase + 1, rlBase + 5, rlBase + 4);
+      // Right rail strip (vertices 2, 3)
+      railIndices.push(rlBase + 2, rlBase + 6, rlBase + 3);
+      railIndices.push(rlBase + 3, rlBase + 6, rlBase + 7);
     }
   }
 
   const roadGeo = new THREE.BufferGeometry();
-  roadGeo.setAttribute('position', new THREE.Float32BufferAttribute(roadPositions, 3));
-  roadGeo.setAttribute('normal', new THREE.Float32BufferAttribute(roadNormals, 3));
+  roadGeo.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(roadPositions, 3)
+  );
+  roadGeo.setAttribute(
+    'normal',
+    new THREE.Float32BufferAttribute(roadNormals, 3)
+  );
   roadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(roadUvs, 2));
   roadGeo.setIndex(roadIndices);
   roadGeo.computeBoundingSphere();
 
   const roadMat = new THREE.MeshStandardMaterial({
     map: asphaltTexture,
-    roughness: isMidnight ? 0.42 : 0.65,
-    metalness: isMidnight ? 0.25 : 0.12,
+    roughness: isMidnight ? 0.42 : 0.62,
+    metalness: isMidnight ? 0.25 : 0.1,
   });
   const roadMesh = new THREE.Mesh(roadGeo, roadMat);
   roadMesh.receiveShadow = true;
@@ -614,8 +1347,14 @@ export function buildRacingTrack(
   materialsToDispose.push(roadMat);
 
   const skirtGeo = new THREE.BufferGeometry();
-  skirtGeo.setAttribute('position', new THREE.Float32BufferAttribute(skirtPositions, 3));
-  skirtGeo.setAttribute('normal', new THREE.Float32BufferAttribute(skirtNormals, 3));
+  skirtGeo.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(skirtPositions, 3)
+  );
+  skirtGeo.setAttribute(
+    'normal',
+    new THREE.Float32BufferAttribute(skirtNormals, 3)
+  );
   skirtGeo.setAttribute('uv', new THREE.Float32BufferAttribute(skirtUvs, 2));
   skirtGeo.setIndex(skirtIndices);
   skirtGeo.computeVertexNormals();
@@ -624,9 +1363,10 @@ export function buildRacingTrack(
   const skirtMat = new THREE.MeshStandardMaterial({
     map: groundSandTexture,
     roughnessMap: groundSheenMap,
-    color: new THREE.Color(isCanyon ? '#C26A4A' : '#475569'),
+    color: new THREE.Color(isCanyon ? '#E5C5A8' : '#64748B'),
     roughness: 0.86,
     metalness: 0.06,
+    side: THREE.DoubleSide,
   });
   const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
   skirtMesh.receiveShadow = true;
@@ -634,9 +1374,74 @@ export function buildRacingTrack(
   geometriesToDispose.push(skirtGeo);
   materialsToDispose.push(skirtMat);
 
-  // Scattered Trackside Gravel Patches with Subtle Moonlit Sheen (InstancedMesh)
+  // Trackside Gravel Run-Off Apron Mesh (immediately outside the red/white kerbs)
+  const apronGeo = new THREE.BufferGeometry();
+  apronGeo.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(apronPositions, 3)
+  );
+  apronGeo.setAttribute(
+    'normal',
+    new THREE.Float32BufferAttribute(apronNormals, 3)
+  );
+  apronGeo.setAttribute('uv', new THREE.Float32BufferAttribute(apronUvs, 2));
+  apronGeo.setIndex(apronIndices);
+  apronGeo.computeVertexNormals();
+  apronGeo.computeBoundingSphere();
+
+  const apronMat = new THREE.MeshStandardMaterial({
+    map: groundSandTexture,
+    roughnessMap: groundSheenMap,
+    color: new THREE.Color(isCanyon ? '#D4955A' : '#64748B'),
+    roughness: 0.9,
+    metalness: 0.04,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+    side: THREE.DoubleSide,
+  });
+  const apronMesh = new THREE.Mesh(apronGeo, apronMat);
+  apronMesh.receiveShadow = true;
+  group.add(apronMesh);
+  geometriesToDispose.push(apronGeo);
+  materialsToDispose.push(apronMat);
+
+  // Continuous Metallic Armco W-Beam Guardrail Ribbon along both sides of the track
+  const railGeo = new THREE.BufferGeometry();
+  railGeo.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(railPositions, 3)
+  );
+  railGeo.setAttribute(
+    'normal',
+    new THREE.Float32BufferAttribute(railNormals, 3)
+  );
+  railGeo.setIndex(railIndices);
+  railGeo.computeBoundingSphere();
+
+  const railMat = new THREE.MeshStandardMaterial({
+    color: 0xcbd5e1,
+    metalness: 0.72,
+    roughness: 0.34,
+    side: THREE.DoubleSide,
+  });
+  const railMesh = new THREE.Mesh(railGeo, railMat);
+  railMesh.castShadow = true;
+  railMesh.receiveShadow = true;
+  group.add(railMesh);
+  geometriesToDispose.push(railGeo);
+  materialsToDispose.push(railMat);
+
+  // Reusable transform objects for consistent compose(position, quaternion, scale)
+  const instPos = new THREE.Vector3();
+  const instQuat = new THREE.Quaternion();
+  const instScale = new THREE.Vector3();
+  const instMatrix = new THREE.Matrix4();
+  const tempColor = new THREE.Color();
+
+  // Scattered Trackside Gravel Patches on the Run-Off Verge (InstancedMesh, Upright Yaw-Only)
   const gravelPatchCount = 44;
-  const gravelPatchGeo = new THREE.PlaneGeometry(7.5, 11.5);
+  const gravelPatchGeo = new THREE.PlaneGeometry(5.5, 9.5);
   gravelPatchGeo.rotateX(-Math.PI / 2);
   const gravelPatchMat = new THREE.MeshStandardMaterial({
     map: gravelPatchTexture,
@@ -660,20 +1465,21 @@ export function buildRacingTrack(
   for (let i = 0; i < gravelPatchCount; i++) {
     const s = (i / gravelPatchCount) * TRACK_LENGTH + 15;
     evaluateTrackFrame(s, frame);
+    getHorizontalTrackNormal(frame.tangent, normalXZ);
     const side = i % 2 === 0 ? 1 : -1;
-    const latOffset = ROAD_HALF_WIDTH + 2.8 + (i % 3) * 1.6;
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latOffset);
-    dummy.position.y = getEmbankmentSurfaceY(frame, side, latOffset) + 0.05;
+    const latOffset = MIN_SAFE_PROP_OFFSET + 3.2 + (i % 3) * 1.2;
 
-    const lookPt = new THREE.Vector3().copy(dummy.position).add(frame.tangent);
-    dummy.lookAt(lookPt);
-    dummy.rotation.z = side * -0.42;
-    const sc = 0.8 + (i % 4) * 0.25;
-    dummy.scale.set(sc, 1, sc * 1.15);
-    dummy.updateMatrix();
-    gravelPatchInst.setMatrixAt(i, dummy.matrix);
+    instPos
+      .copy(frame.position)
+      .addScaledVector(normalXZ, side * latOffset);
+    instPos.y = getEmbankmentSurfaceY(frame, side, latOffset) + 0.05;
+
+    const yaw = getTrackYawFacingTrack(frame.tangent, side);
+    instQuat.setFromAxisAngle(_up, yaw);
+    const sc = 0.75 + (i % 4) * 0.18;
+    instScale.set(sc, 1, sc);
+    instMatrix.compose(instPos, instQuat, instScale);
+    gravelPatchInst.setMatrixAt(i, instMatrix);
   }
   gravelPatchInst.instanceMatrix.needsUpdate = true;
   gravelPatchInst.computeBoundingSphere();
@@ -689,54 +1495,71 @@ export function buildRacingTrack(
   });
   materialsToDispose.push(bandedRockMat);
 
-  // Formation A: Stepped Flat-Top Mesas (Base + Upper Plateau Cap)
+  // Formation A: Stepped Flat-Top Mesas (Base + Upper Plateau Cap, Pivot at Base y = 0)
   const mesaCount = 52;
   const mesaBaseGeo = new THREE.CylinderGeometry(5.5, 9.2, 16, 7);
   mesaBaseGeo.translate(0, 8, 0);
   const mesaCapGeo = new THREE.CylinderGeometry(4.2, 5.2, 8.5, 7);
   mesaCapGeo.translate(0, 20, 0);
 
-  const mesaBaseInst = new THREE.InstancedMesh(mesaBaseGeo, bandedRockMat, mesaCount);
-  const mesaCapInst = new THREE.InstancedMesh(mesaCapGeo, bandedRockMat, mesaCount);
+  const mesaBaseInst = new THREE.InstancedMesh(
+    mesaBaseGeo,
+    bandedRockMat,
+    mesaCount
+  );
+  const mesaCapInst = new THREE.InstancedMesh(
+    mesaCapGeo,
+    bandedRockMat,
+    mesaCount
+  );
   mesaBaseInst.castShadow = true;
   mesaBaseInst.receiveShadow = true;
   mesaCapInst.castShadow = true;
   geometriesToDispose.push(mesaBaseGeo, mesaCapGeo);
 
+  const mesaYawOffsets = new Float32Array(mesaCount);
   for (let i = 0; i < mesaCount; i++) {
     const s = (i / mesaCount) * TRACK_LENGTH + (i % 3) * 11;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-    const latDist = ROAD_HALF_WIDTH + 34 + ((i * 19) % 75);
-
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = -18.2;
+    const latDist = ROAD_HALF_WIDTH + 48 + ((i * 19) % 75);
 
     const sx = 1.1 + ((i * 23) % 140) / 100;
     const sy = 0.85 + ((i * 31) % 130) / 100;
     const sz = 1.1 + ((i * 17) % 140) / 100;
-    dummy.scale.set(sx, sy, sz);
-    dummy.rotation.set(0, (i * 1.37) % (Math.PI * 2), 0);
-    dummy.updateMatrix();
+    instScale.set(sx, sy, sz);
 
-    mesaBaseInst.setMatrixAt(i, dummy.matrix);
-    mesaCapInst.setMatrixAt(i, dummy.matrix);
+    mesaYawOffsets[i] = ((i * 0.45) % 1.2) - 0.6;
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      9.2 * Math.max(sx, sz),
+      mesaYawOffsets[i],
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+
+    mesaBaseInst.setMatrixAt(i, instMatrix);
+    mesaCapInst.setMatrixAt(i, instMatrix);
 
     tempColor.set(
       isCanyon
         ? i % 3 === 0
-          ? '#F97316'
+          ? '#F59E0B'
           : i % 3 === 1
-            ? '#EA580C'
-            : '#D97706'
+            ? '#D97706'
+            : '#C27838'
         : isMidnight
           ? '#334155'
           : '#64748B'
     );
     mesaBaseInst.setColorAt(i, tempColor);
-    mesaCapInst.setColorAt(i, tempColor.clone().multiplyScalar(1.12));
+    mesaCapInst.setColorAt(i, tempColor.clone().multiplyScalar(1.08));
   }
   mesaBaseInst.instanceMatrix.needsUpdate = true;
   mesaCapInst.instanceMatrix.needsUpdate = true;
@@ -746,11 +1569,23 @@ export function buildRacingTrack(
   mesaCapInst.computeBoundingSphere();
   group.add(mesaBaseInst, mesaCapInst);
 
-  // Formation B: Tall Layered Sandstone Pillars / Hoodoos
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'CanyonMesas',
+    mesh: mesaBaseInst,
+    companionMesh: mesaCapInst,
+    count: mesaCount,
+    inwardRadius: 9.2,
+    yawOffsets: mesaYawOffsets,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(18.4, 24.2, 18.4),
+  });
+
+  // Formation B: Tall Layered Sandstone Pillars / Hoodoos (Pivot at Base y = 0)
   const pillarCount = 64;
   const rockPillarGeo = new THREE.CylinderGeometry(1.3, 2.6, 26, 6, 4);
   rockPillarGeo.translate(0, 13, 0);
-  // Pinch/bulge strata rings along pillar height
   const pPos = rockPillarGeo.attributes.position;
   for (let k = 0; k < pPos.count; k++) {
     const py = pPos.getY(k);
@@ -760,33 +1595,43 @@ export function buildRacingTrack(
   }
   rockPillarGeo.computeVertexNormals();
 
-  const pillarInst = new THREE.InstancedMesh(rockPillarGeo, bandedRockMat, pillarCount);
+  const pillarInst = new THREE.InstancedMesh(
+    rockPillarGeo,
+    bandedRockMat,
+    pillarCount
+  );
   pillarInst.castShadow = true;
   geometriesToDispose.push(rockPillarGeo);
 
+  const pillarYawOffsets = new Float32Array(pillarCount);
   for (let i = 0; i < pillarCount; i++) {
     const s = (i / pillarCount) * TRACK_LENGTH + 18;
-    evaluateTrackFrame(s, frame);
     const side = (i + 1) % 2 === 0 ? 1 : -1;
-    const latDist = ROAD_HALF_WIDTH + 20 + ((i * 29) % 55);
-
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = -18.2;
+    const latDist = ROAD_HALF_WIDTH + 38 + ((i * 29) % 55);
 
     const wScale = 0.8 + ((i * 13) % 90) / 100;
     const hScale = 0.75 + ((i * 37) % 140) / 100;
-    dummy.scale.set(wScale, hScale, wScale * (0.85 + ((i * 7) % 30) / 100));
-    dummy.rotation.set(
-      ((i % 5) - 2) * 0.02,
-      (i * 2.1) % (Math.PI * 2),
-      ((i % 7) - 3) * 0.02
-    );
-    dummy.updateMatrix();
-    pillarInst.setMatrixAt(i, dummy.matrix);
+    const zScale = wScale * (0.85 + ((i * 7) % 30) / 100);
+    instScale.set(wScale, hScale, zScale);
 
-    tempColor.set(isCanyon ? (i % 2 === 0 ? '#EA580C' : '#F59E0B') : '#475569');
+    pillarYawOffsets[i] = ((i % 5) - 2) * 0.2;
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      2.8 * Math.max(wScale, zScale),
+      pillarYawOffsets[i],
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+    pillarInst.setMatrixAt(i, instMatrix);
+
+    tempColor.set(isCanyon ? (i % 2 === 0 ? '#D97706' : '#F59E0B') : '#475569');
     pillarInst.setColorAt(i, tempColor);
   }
   pillarInst.instanceMatrix.needsUpdate = true;
@@ -794,7 +1639,19 @@ export function buildRacingTrack(
   pillarInst.computeBoundingSphere();
   group.add(pillarInst);
 
-  // Formation C: Natural Sandstone Canyon Arches
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'SandstonePillars',
+    mesh: pillarInst,
+    count: pillarCount,
+    inwardRadius: 2.8,
+    yawOffsets: pillarYawOffsets,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(5.2, 26, 5.2),
+  });
+
+  // Formation C: Natural Sandstone Canyon Arches (Pivot at Base y = 0)
   const archCount = 16;
   const archGeo = new THREE.TorusGeometry(11, 2.6, 7, 16, Math.PI);
   const archInst = new THREE.InstancedMesh(archGeo, bandedRockMat, archCount);
@@ -803,20 +1660,28 @@ export function buildRacingTrack(
 
   for (let i = 0; i < archCount; i++) {
     const s = (i / archCount) * TRACK_LENGTH + 75;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-    const latDist = ROAD_HALF_WIDTH + 26 + (i % 3) * 14;
+    const latDist = ROAD_HALF_WIDTH + 52 + (i % 3) * 14;
 
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = -16.5;
-    dummy.rotation.set(0, (i * 0.9) % Math.PI, 0);
-    const sc = 0.9 + (i % 4) * 0.28;
-    dummy.scale.set(sc * 1.2, sc, sc * 0.85);
-    dummy.updateMatrix();
-    archInst.setMatrixAt(i, dummy.matrix);
-    tempColor.set(isCanyon ? '#C2410C' : '#475569');
+    const sc = 0.9 + (i % 4) * 0.25;
+    instScale.set(sc * 1.15, sc, sc * 0.85);
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      13.6 * sc * 1.15,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+    archInst.setMatrixAt(i, instMatrix);
+
+    tempColor.set(isCanyon ? '#D97706' : '#475569');
     archInst.setColorAt(i, tempColor);
   }
   archInst.instanceMatrix.needsUpdate = true;
@@ -824,42 +1689,61 @@ export function buildRacingTrack(
   archInst.computeBoundingSphere();
   group.add(archInst);
 
-  // Formation D: Scattered Boulders & Track-Edge Small Rocks
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'CanyonArches',
+    mesh: archInst,
+    count: archCount,
+    inwardRadius: 13.6,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(24, 13.6, 5.2),
+  });
+
+  // Formation D: Scattered Boulders & Trackside Rocks (Pivot at Base y = 0, Safe Offset)
   const boulderCount = 140;
-  const boulderGeo = new THREE.DodecahedronGeometry(1.6, 1);
-  boulderGeo.translate(0, 0.9, 0);
-  const boulderInst = new THREE.InstancedMesh(boulderGeo, bandedRockMat, boulderCount);
+  const boulderGeo = new THREE.DodecahedronGeometry(1.4, 1);
+  boulderGeo.translate(0, 1.15, 0);
+  const boulderInst = new THREE.InstancedMesh(
+    boulderGeo,
+    bandedRockMat,
+    boulderCount
+  );
   geometriesToDispose.push(boulderGeo);
 
+  const boulderYawOffsets = new Float32Array(boulderCount);
   for (let i = 0; i < boulderCount; i++) {
     const s = (i / boulderCount) * TRACK_LENGTH;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-    // Half near the road shoulder, half further out in the desert
     const isNearEdge = i % 3 !== 0;
     const latDist = isNearEdge
-      ? ROAD_HALF_WIDTH + 2.8 + (i % 5) * 1.4
-      : ROAD_HALF_WIDTH + 15 + (i % 9) * 3.5;
+      ? MIN_SAFE_PROP_OFFSET + 2.6 + (i % 5) * 1.2
+      : ROAD_HALF_WIDTH + 38 + (i % 9) * 3.5;
 
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = getEmbankmentSurfaceY(frame, side, latDist);
+    const sx = isNearEdge ? 0.45 + (i % 4) * 0.22 : 1.3 + (i % 5) * 0.65;
+    const sy = sx * (0.58 + (i % 3) * 0.18);
+    const sz = sx * (0.8 + (i % 4) * 0.2);
+    instScale.set(sx, sy, sz);
 
-    const sx = isNearEdge ? 0.45 + (i % 4) * 0.25 : 1.4 + (i % 5) * 0.8;
-    const sy = sx * (0.55 + (i % 3) * 0.2);
-    const sz = sx * (0.8 + (i % 4) * 0.25);
-    dummy.scale.set(sx, sy, sz);
-    dummy.rotation.set(i * 0.4, i * 1.1, (i % 3) * 0.2);
-    dummy.updateMatrix();
-    boulderInst.setMatrixAt(i, dummy.matrix);
+    boulderYawOffsets[i] = ((i % 7) - 3) * 0.25;
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      1.4 * Math.max(sx, sz),
+      boulderYawOffsets[i],
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+    boulderInst.setMatrixAt(i, instMatrix);
 
     tempColor.set(
-      isCanyon
-        ? i % 2 === 0
-          ? '#B45309'
-          : '#9A3412'
-        : '#475569'
+      isCanyon ? (i % 2 === 0 ? '#C27838' : '#A1622F') : '#475569'
     );
     boulderInst.setColorAt(i, tempColor);
   }
@@ -868,10 +1752,22 @@ export function buildRacingTrack(
   boulderInst.computeBoundingSphere();
   group.add(boulderInst);
 
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'TracksideBoulders',
+    mesh: boulderInst,
+    count: boulderCount,
+    inwardRadius: 1.4,
+    yawOffsets: boulderYawOffsets,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(2.8, 2.4, 2.8),
+  });
+
   // ============================================================================
   // 5. GROUND FLORA & TIRE-MARK PATCHES: CACTI, DRY BUSHES & SKID DECALS
   // ============================================================================
-  // Saguaro Cacti (Composite Trunk + Twin Arms InstancedMeshes)
+  // Saguaro Cacti (Composite Trunk + Twin Arms InstancedMeshes, Pivot at Base y = 0)
   const cactiCount = 75;
   const cactusTrunkGeo = new THREE.CylinderGeometry(0.28, 0.36, 4.6, 7);
   cactusTrunkGeo.translate(0, 2.3, 0);
@@ -882,28 +1778,45 @@ export function buildRacingTrack(
     roughness: 0.85,
     metalness: 0.05,
   });
-  const cactusTrunkInst = new THREE.InstancedMesh(cactusTrunkGeo, cactusMat, cactiCount);
-  const cactusArmInst = new THREE.InstancedMesh(cactusArmGeo, cactusMat, cactiCount);
+  const cactusTrunkInst = new THREE.InstancedMesh(
+    cactusTrunkGeo,
+    cactusMat,
+    cactiCount
+  );
+  const cactusArmInst = new THREE.InstancedMesh(
+    cactusArmGeo,
+    cactusMat,
+    cactiCount
+  );
   geometriesToDispose.push(cactusTrunkGeo, cactusArmGeo);
   materialsToDispose.push(cactusMat);
 
+  const cactiYawOffsets = new Float32Array(cactiCount);
   for (let i = 0; i < cactiCount; i++) {
     const s = (i / cactiCount) * TRACK_LENGTH + 9;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? -1 : 1;
-    const latDist = ROAD_HALF_WIDTH + 5.5 + (i % 6) * 2.4;
+    const latDist = MIN_SAFE_PROP_OFFSET + 3.0 + (i % 5) * 1.4;
 
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = getEmbankmentSurfaceY(frame, side, latDist);
     const sc = 0.75 + (i % 5) * 0.14;
-    dummy.scale.set(sc, sc, sc);
-    dummy.rotation.set(0, (i * 1.7) % (Math.PI * 2), 0);
-    dummy.updateMatrix();
+    instScale.set(sc, sc, sc);
+    cactiYawOffsets[i] = ((i % 5) - 2) * 0.25;
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      0.8 * sc,
+      cactiYawOffsets[i],
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
 
-    cactusTrunkInst.setMatrixAt(i, dummy.matrix);
-    cactusArmInst.setMatrixAt(i, dummy.matrix);
+    cactusTrunkInst.setMatrixAt(i, instMatrix);
+    cactusArmInst.setMatrixAt(i, instMatrix);
   }
   cactusTrunkInst.instanceMatrix.needsUpdate = true;
   cactusArmInst.instanceMatrix.needsUpdate = true;
@@ -911,11 +1824,24 @@ export function buildRacingTrack(
   cactusArmInst.computeBoundingSphere();
   group.add(cactusTrunkInst, cactusArmInst);
 
-  // Dry Desert Scrub Bushes near track edges
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'SaguaroCacti',
+    mesh: cactusTrunkInst,
+    companionMesh: cactusArmInst,
+    count: cactiCount,
+    inwardRadius: 0.8,
+    yawOffsets: cactiYawOffsets,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(1.5, 4.6, 0.8),
+  });
+
+  // Dry Desert Scrub Bushes on Trackside Verge (Pivot at Base y = 0, Safe Offset)
   const bushCount = 110;
   const bushGeo = new THREE.IcosahedronGeometry(0.75, 1);
   bushGeo.scale(1.3, 0.65, 1.3);
-  bushGeo.translate(0, 0.4, 0);
+  bushGeo.translate(0, 0.48, 0);
   const bushMat = new THREE.MeshStandardMaterial({
     color: isCanyon ? 0x78350f : 0x1e3a2f,
     roughness: 0.92,
@@ -926,19 +1852,26 @@ export function buildRacingTrack(
 
   for (let i = 0; i < bushCount; i++) {
     const s = (i / bushCount) * TRACK_LENGTH + 4;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-    const latDist = ROAD_HALF_WIDTH + 2.1 + (i % 4) * 1.3;
+    const latDist = MIN_SAFE_PROP_OFFSET + 1.8 + (i % 4) * 1.4;
 
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    dummy.position.y = getEmbankmentSurfaceY(frame, side, latDist);
     const sc = 0.65 + (i % 5) * 0.22;
-    dummy.scale.set(sc, sc * 0.8, sc);
-    dummy.rotation.set(0, i * 1.1, 0);
-    dummy.updateMatrix();
-    bushInst.setMatrixAt(i, dummy.matrix);
+    instScale.set(sc, sc * 0.8, sc);
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      0.95 * sc,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+    bushInst.setMatrixAt(i, instMatrix);
 
     tempColor.set(i % 2 === 0 ? '#92400E' : '#65A30D');
     bushInst.setColorAt(i, tempColor);
@@ -948,7 +1881,18 @@ export function buildRacingTrack(
   bushInst.computeBoundingSphere();
   group.add(bushInst);
 
-  // Tire-Mark Skid Patches near Corner Braking Zones & Track Edges
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'DesertScrubBushes',
+    mesh: bushInst,
+    count: bushCount,
+    inwardRadius: 0.95,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(1.9, 1.0, 1.9),
+  });
+
+  // Tire-Mark Skid Patches on Asphalt Surface near Corner Braking Zones
   const skidGeo = new THREE.PlaneGeometry(3.4, 18);
   skidGeo.rotateX(-Math.PI / 2);
   const skidMat = new THREE.MeshBasicMaterial({
@@ -980,7 +1924,7 @@ export function buildRacingTrack(
   // ============================================================================
   // 6. TRACKSIDE DETAILS: GRANDSTANDS, BANNERS, LIGHT POLES, TIRE BARRIERS & SIGNS
   // ============================================================================
-  // A. Grandstands at Main Straight & Key Stadium Corners
+  // A. Grandstands at Main Straight & Key Stadium Corners (Pivot at Base y = 0, Upright Yaw-Only)
   const grandstandLocations = [
     { s: 45, side: -1 },
     { s: 135, side: 1 },
@@ -988,6 +1932,7 @@ export function buildRacingTrack(
     { s: 1580, side: 1 },
     { s: 2310, side: -1 },
   ];
+  const standPlinthGeo = new THREE.BoxGeometry(28.4, 2.2, 8.8);
   const standBaseGeo = new THREE.BoxGeometry(28, 5.5, 8.5);
   const standRoofGeo = new THREE.BoxGeometry(29.5, 0.45, 10.5);
   const standPillarGeo = new THREE.CylinderGeometry(0.25, 0.25, 6.5, 8);
@@ -1005,27 +1950,39 @@ export function buildRacingTrack(
     roughness: 0.55,
     metalness: 0.15,
   });
-  geometriesToDispose.push(standBaseGeo, standRoofGeo, standPillarGeo);
+  geometriesToDispose.push(
+    standPlinthGeo,
+    standBaseGeo,
+    standRoofGeo,
+    standPillarGeo
+  );
   materialsToDispose.push(standStructureMat, standSeatsMat, standRoofMat);
 
-  grandstandLocations.forEach(({ s, side }) => {
-    evaluateTrackFrame(s, frame);
+  grandstandLocations.forEach(({ s, side }, idx) => {
     const standGroup = new THREE.Group();
-    const latDist = ROAD_HALF_WIDTH + 9.5;
-    standGroup.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * latDist);
-    standGroup.position.y = getEmbankmentSurfaceY(frame, side, latDist);
+    const latDist = MIN_SAFE_PROP_OFFSET + 6.5;
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      4.5,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      standGroup.position,
+      standGroup.quaternion
+    );
 
-    // Face toward the track
-    const lookTarget = new THREE.Vector3().copy(frame.position);
-    standGroup.lookAt(lookTarget);
+    const plinthMesh = new THREE.Mesh(standPlinthGeo, standStructureMat);
+    plinthMesh.position.set(0, -1.0, 0);
+    standGroup.add(plinthMesh);
 
     const baseMesh = new THREE.Mesh(standBaseGeo, standStructureMat);
     baseMesh.position.set(0, 2.75, 0);
     standGroup.add(baseMesh);
 
-    // 3 Tiered Seating Steps
     for (let t = 0; t < 3; t++) {
       const tierGeo = new THREE.BoxGeometry(26.5, 0.9, 2.1);
       geometriesToDispose.push(tierGeo);
@@ -1037,7 +1994,6 @@ export function buildRacingTrack(
       standGroup.add(tierMesh);
     }
 
-    // Angled Canopy Roof
     const roofMesh = new THREE.Mesh(standRoofGeo, standRoofMat);
     roofMesh.position.set(0, 9.2, -0.5);
     roofMesh.rotation.x = 0.14;
@@ -1050,22 +2006,69 @@ export function buildRacingTrack(
     });
 
     group.add(standGroup);
+
+    registeredProps.push({
+      kind: 'object',
+      name: `Grandstand_${idx}_s${s}`,
+      object: standGroup,
+      inwardRadius: 4.5,
+      yawOffset: 0,
+      allowTilt: false,
+      groundYOffset: 0,
+      localBoxSize: new THREE.Vector3(28, 9.5, 8.8),
+    });
   });
 
-  // B. Trackside Sponsor Banners at Key Corners
+  // B. Trackside Sponsor Banners at Key Corners (Pivot at Base y = 0 with Support Legs, Upright Yaw-Only)
   const bannerSpecs = [
     { s: 210, side: 1, text: 'APEX HORIZON', bg: '#0F172A', accent: '#F59E0B' },
-    { s: 520, side: -1, text: 'RED ROCK CANYON', bg: '#7C2D12', accent: '#F97316' },
-    { s: 940, side: 1, text: 'SOLAR TURBO V10', bg: '#0F172A', accent: '#06B6D4' },
-    { s: 1320, side: -1, text: 'APEX CARBON WORKS', bg: '#1E1B4B', accent: '#F43F5E' },
-    { s: 1760, side: 1, text: 'NEVADA SECTOR GP', bg: '#7C2D12', accent: '#FBBF24' },
-    { s: 2120, side: -1, text: 'NITRO ENDURANCE', bg: '#0F172A', accent: '#10B981' },
+    {
+      s: 520,
+      side: -1,
+      text: 'RED ROCK CANYON',
+      bg: '#7C2D12',
+      accent: '#F97316',
+    },
+    {
+      s: 940,
+      side: 1,
+      text: 'SOLAR TURBO V10',
+      bg: '#0F172A',
+      accent: '#06B6D4',
+    },
+    {
+      s: 1320,
+      side: -1,
+      text: 'APEX CARBON WORKS',
+      bg: '#1E1B4B',
+      accent: '#F43F5E',
+    },
+    {
+      s: 1760,
+      side: 1,
+      text: 'NEVADA SECTOR GP',
+      bg: '#7C2D12',
+      accent: '#FBBF24',
+    },
+    {
+      s: 2120,
+      side: -1,
+      text: 'NITRO ENDURANCE',
+      bg: '#0F172A',
+      accent: '#10B981',
+    },
   ];
   const bannerBoardGeo = new THREE.BoxGeometry(11.5, 2.4, 0.25);
-  geometriesToDispose.push(bannerBoardGeo);
+  const bannerPostGeo = new THREE.CylinderGeometry(0.14, 0.16, 3.6, 8);
+  geometriesToDispose.push(bannerBoardGeo, bannerPostGeo);
 
-  bannerSpecs.forEach((b) => {
-    const tex = createSponsorBannerTexture(maxAnisotropy, b.text, b.bg, b.accent);
+  bannerSpecs.forEach((b, idx) => {
+    const tex = createSponsorBannerTexture(
+      maxAnisotropy,
+      b.text,
+      b.bg,
+      b.accent
+    );
     texturesToDispose.push(tex);
     const mat = new THREE.MeshStandardMaterial({
       map: tex,
@@ -1074,18 +2077,46 @@ export function buildRacingTrack(
     });
     materialsToDispose.push(mat);
 
-    evaluateTrackFrame(b.s, frame);
-    const mesh = new THREE.Mesh(bannerBoardGeo, mat);
-    mesh.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, b.side * (ROAD_HALF_WIDTH + 2.4));
-    mesh.position.y += 1.3;
-    const look = new THREE.Vector3().copy(frame.position);
-    mesh.lookAt(look);
-    group.add(mesh);
+    const bannerGroup = new THREE.Group();
+    const latDist = MIN_SAFE_PROP_OFFSET + 2.8;
+    computeValidatedPropPlacement(
+      b.s,
+      b.side,
+      latDist,
+      0.8,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      bannerGroup.position,
+      bannerGroup.quaternion
+    );
+
+    const leftLeg = new THREE.Mesh(bannerPostGeo, standStructureMat);
+    leftLeg.position.set(-4.5, 1.3, -0.16);
+    const rightLeg = new THREE.Mesh(bannerPostGeo, standStructureMat);
+    rightLeg.position.set(4.5, 1.3, -0.16);
+
+    const boardMesh = new THREE.Mesh(bannerBoardGeo, mat);
+    boardMesh.position.set(0, 1.95, 0);
+
+    bannerGroup.add(leftLeg, rightLeg, boardMesh);
+    group.add(bannerGroup);
+
+    registeredProps.push({
+      kind: 'object',
+      name: `SponsorBanner_${idx}_${b.text}`,
+      object: bannerGroup,
+      inwardRadius: 0.8,
+      yawOffset: 0,
+      allowTilt: false,
+      groundYOffset: 0,
+      localBoxSize: new THREE.Vector3(11.5, 3.2, 0.5),
+    });
   });
 
-  // C. Red & White Tire Barriers at Key Corners (InstancedMesh)
+  // C. Red & White Tire Barriers at Key Corners (InstancedMesh, Pivot at Base y = 0, Upright Yaw-Only)
   const tireStackCount = 120;
   const tireBarrierGeo = new THREE.CylinderGeometry(0.58, 0.58, 1.35, 12);
   tireBarrierGeo.translate(0, 0.675, 0);
@@ -1105,33 +2136,54 @@ export function buildRacingTrack(
   let tbIdx = 0;
   cornerBarrierStarts.forEach((startS, cIdx) => {
     const side = cIdx % 2 === 0 ? 1 : -1;
+    const latDist = MIN_SAFE_PROP_OFFSET + 1.25;
     for (let k = 0; k < 20; k++) {
       if (tbIdx >= tireStackCount) break;
-      evaluateTrackFrame(startS + k * 1.45, frame);
-      dummy.position
-        .copy(frame.position)
-        .addScaledVector(frame.right, side * (ROAD_HALF_WIDTH + 1.15));
-      dummy.scale.set(1, 1, 1);
-      dummy.rotation.set(0, 0, 0);
-      dummy.updateMatrix();
-      tireBarrierInst.setMatrixAt(tbIdx, dummy.matrix);
+      instScale.set(1, 1, 1);
+      computeValidatedPropPlacement(
+        startS + k * 1.45,
+        side,
+        latDist,
+        0.58,
+        0,
+        0,
+        trackSamples,
+        frame,
+        normalXZ,
+        instPos,
+        instQuat
+      );
+      instMatrix.compose(instPos, instQuat, instScale);
+      tireBarrierInst.setMatrixAt(tbIdx, instMatrix);
 
-      tempColor.set(k % 2 === 0 ? '#EF4444' : '#CBD5E1');
+      tempColor.set(k % 2 === 0 ? '#B91C1C' : '#CBD5E1');
       tireBarrierInst.setColorAt(tbIdx, tempColor);
       tbIdx++;
     }
   });
   tireBarrierInst.instanceMatrix.needsUpdate = true;
-  if (tireBarrierInst.instanceColor) tireBarrierInst.instanceColor.needsUpdate = true;
+  if (tireBarrierInst.instanceColor)
+    tireBarrierInst.instanceColor.needsUpdate = true;
   tireBarrierInst.computeBoundingSphere();
   group.add(tireBarrierInst);
 
-  // D. Trackside Light Poles with Glowing Warm Luminaires (InstancedMesh)
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'CornerTireBarriers',
+    mesh: tireBarrierInst,
+    count: tireStackCount,
+    inwardRadius: 0.58,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(1.16, 1.35, 1.16),
+  });
+
+  // D. Trackside Light Poles with Glowing Warm Luminaires (InstancedMesh, Pivot at Base y = 0, Overhang along +Z)
   const lightPoleCount = 48;
   const poleShaftGeo = new THREE.CylinderGeometry(0.14, 0.22, 8.8, 8);
   poleShaftGeo.translate(0, 4.4, 0);
-  const poleLampGeo = new THREE.BoxGeometry(1.8, 0.28, 0.55);
-  poleLampGeo.translate(-0.6, 8.8, 0);
+  const poleLampGeo = new THREE.BoxGeometry(0.55, 0.28, 1.8);
+  poleLampGeo.translate(0, 8.8, 0.6);
 
   const poleShaftMat = new THREE.MeshStandardMaterial({
     color: 0x334155,
@@ -1141,7 +2193,7 @@ export function buildRacingTrack(
   const poleLampMat = new THREE.MeshStandardMaterial({
     color: 0xffedd5,
     emissive: new THREE.Color(isMidnight ? '#38BDF8' : '#FDBA74'),
-    emissiveIntensity: 2.6,
+    emissiveIntensity: 1.65,
     toneMapped: false,
   });
   const poleShaftInst = new THREE.InstancedMesh(
@@ -1154,23 +2206,32 @@ export function buildRacingTrack(
     poleLampMat,
     lightPoleCount
   );
+  poleLampInst.layers.enable(TRACK_BLOOM_LAYER);
   geometriesToDispose.push(poleShaftGeo, poleLampGeo);
   materialsToDispose.push(poleShaftMat, poleLampMat);
 
   for (let i = 0; i < lightPoleCount; i++) {
     const s = (i / lightPoleCount) * TRACK_LENGTH;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * (ROAD_HALF_WIDTH + 1.6));
-    const look = new THREE.Vector3().copy(frame.position);
-    dummy.lookAt(look);
-    dummy.rotateY(Math.PI * 0.5);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    poleShaftInst.setMatrixAt(i, dummy.matrix);
-    poleLampInst.setMatrixAt(i, dummy.matrix);
+    const latDist = MIN_SAFE_PROP_OFFSET + 1.6;
+    instScale.set(1, 1, 1);
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      0.6,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+
+    poleShaftInst.setMatrixAt(i, instMatrix);
+    poleLampInst.setMatrixAt(i, instMatrix);
   }
   poleShaftInst.instanceMatrix.needsUpdate = true;
   poleLampInst.instanceMatrix.needsUpdate = true;
@@ -1178,9 +2239,21 @@ export function buildRacingTrack(
   poleLampInst.computeBoundingSphere();
   group.add(poleShaftInst, poleLampInst);
 
-  // E. Wooden Signs & Corner Braking Distance Marker Boards (150m, 100m, 50m)
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'TracksideLightPoles',
+    mesh: poleShaftInst,
+    companionMesh: poleLampInst,
+    count: lightPoleCount,
+    inwardRadius: 0.6,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(0.6, 9.0, 1.8),
+  });
+
+  // E. Wooden Signs & Corner Braking Distance Marker Boards (150m, 100m, 50m - Pivot at Base y = 0, Upright Yaw-Only)
   const markerBoardGeo = new THREE.BoxGeometry(1.9, 1.1, 0.14);
-  const woodPostGeo = new THREE.CylinderGeometry(0.11, 0.11, 2.2, 6);
+  const woodPostGeo = new THREE.CylinderGeometry(0.11, 0.11, 2.4, 6);
   const woodMat = new THREE.MeshStandardMaterial({
     color: 0x78350f,
     roughness: 0.9,
@@ -1199,25 +2272,43 @@ export function buildRacingTrack(
 
   [350, 1150, 1920].forEach((turnEntryDist, turnIdx) => {
     const side = turnIdx % 2 === 0 ? -1 : 1;
+    const latDist = MIN_SAFE_PROP_OFFSET + 1.25;
     markerTextures.forEach((mat, mIdx) => {
       const dist = turnEntryDist - (2 - mIdx) * 32;
-      evaluateTrackFrame(dist, frame);
+      const yawOffset = side * -0.32;
 
       const signGroup = new THREE.Group();
-      signGroup.position
-        .copy(frame.position)
-        .addScaledVector(frame.right, side * (ROAD_HALF_WIDTH + 2.1));
-      const look = new THREE.Vector3()
-        .copy(signGroup.position)
-        .sub(frame.tangent);
-      signGroup.lookAt(look);
+      computeValidatedPropPlacement(
+        dist,
+        side,
+        latDist,
+        0.5,
+        yawOffset,
+        0,
+        trackSamples,
+        frame,
+        normalXZ,
+        signGroup.position,
+        signGroup.quaternion
+      );
 
       const post = new THREE.Mesh(woodPostGeo, woodMat);
-      post.position.y = 1.1;
+      post.position.y = 1.05;
       const board = new THREE.Mesh(markerBoardGeo, mat);
       board.position.y = 1.85;
       signGroup.add(post, board);
       group.add(signGroup);
+
+      registeredProps.push({
+        kind: 'object',
+        name: `BrakingMarker_${turnIdx}_${markerLabels[mIdx]}`,
+        object: signGroup,
+        inwardRadius: 0.5,
+        yawOffset,
+        allowTilt: false,
+        groundYOffset: 0,
+        localBoxSize: new THREE.Vector3(1.9, 2.4, 0.35),
+      });
     });
   });
 
@@ -1247,8 +2338,9 @@ export function buildRacingTrack(
 
   // Gantry structure at s = 0, s = 800 (Sector 1), s = 1600 (Sector 2)
   const gantryLights: THREE.MeshStandardMaterial[] = [];
-  const pillarGeo = new THREE.BoxGeometry(0.9, 9.5, 1.2);
-  const beamGeo = new THREE.BoxGeometry(ROAD_HALF_WIDTH * 2 + 3.2, 1.4, 1.4);
+  const gantryHalfSpan = MIN_SAFE_PROP_OFFSET + 0.7; // 16.2m from centreline
+  const pillarGeo = new THREE.BoxGeometry(0.95, 10.6, 1.25);
+  const beamGeo = new THREE.BoxGeometry(gantryHalfSpan * 2 + 1.4, 1.4, 1.4);
   const gantryMetalMat = new THREE.MeshStandardMaterial({
     color: 0x1e293b,
     metalness: 0.8,
@@ -1257,7 +2349,7 @@ export function buildRacingTrack(
   const sectorNeonMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(config.curbPrimaryHex),
     emissive: new THREE.Color(config.curbPrimaryHex),
-    emissiveIntensity: 2.2,
+    emissiveIntensity: 1.55,
     toneMapped: false,
   });
   geometriesToDispose.push(pillarGeo, beamGeo);
@@ -1267,19 +2359,25 @@ export function buildRacingTrack(
     evaluateTrackFrame(gantryDist, frame);
     const gantryGroup = new THREE.Group();
     gantryGroup.position.copy(frame.position);
-    const target = new THREE.Vector3().copy(frame.position).add(frame.tangent);
-    gantryGroup.lookAt(target);
+
+    const tangentYaw = Math.atan2(frame.tangent.x, frame.tangent.z);
+    gantryGroup.rotation.set(0, tangentYaw, 0);
 
     const leftPillar = new THREE.Mesh(pillarGeo, gantryMetalMat);
-    leftPillar.position.set(-(ROAD_HALF_WIDTH + 1.1), 4.75, 0);
+    leftPillar.position.set(-gantryHalfSpan, 4.3, 0);
     const rightPillar = new THREE.Mesh(pillarGeo, gantryMetalMat);
-    rightPillar.position.set(ROAD_HALF_WIDTH + 1.1, 4.75, 0);
+    rightPillar.position.set(gantryHalfSpan, 4.3, 0);
     const topBeam = new THREE.Mesh(beamGeo, gantryMetalMat);
     topBeam.position.set(0, 9.2, 0);
 
-    const accentStripGeo = new THREE.BoxGeometry(ROAD_HALF_WIDTH * 2, 0.18, 1.5);
+    const accentStripGeo = new THREE.BoxGeometry(
+      gantryHalfSpan * 2,
+      0.18,
+      1.5
+    );
     const accentStrip = new THREE.Mesh(accentStripGeo, sectorNeonMat);
     accentStrip.position.set(0, 8.45, 0);
+    accentStrip.layers.enable(TRACK_BLOOM_LAYER);
     geometriesToDispose.push(accentStripGeo);
 
     gantryGroup.add(leftPillar, rightPillar, topBeam, accentStrip);
@@ -1300,6 +2398,7 @@ export function buildRacingTrack(
 
         const pod = new THREE.Mesh(podGeo, lightMat);
         pod.position.set((p - 2) * 1.45, 7.75, 0.75);
+        pod.layers.enable(TRACK_BLOOM_LAYER);
         gantryGroup.add(pod);
       }
     }
@@ -1314,7 +2413,7 @@ export function buildRacingTrack(
   const padMat = new THREE.MeshStandardMaterial({
     color: 0x06b6d4,
     emissive: 0x06b6d4,
-    emissiveIntensity: 2.0,
+    emissiveIntensity: 1.4,
     roughness: 0.2,
     toneMapped: false,
     polygonOffset: true,
@@ -1342,6 +2441,7 @@ export function buildRacingTrack(
       .addScaledVector(frame.up, 0.08);
     const lookPt = new THREE.Vector3().copy(mesh.position).add(frame.tangent);
     mesh.lookAt(lookPt);
+    mesh.layers.enable(TRACK_BLOOM_LAYER);
     group.add(mesh);
 
     boostPads.push({
@@ -1351,9 +2451,9 @@ export function buildRacingTrack(
     });
   });
 
-  // Roadside Guardrail Posts (InstancedMesh)
+  // Roadside Guardrail Posts (InstancedMesh, Pivot at Base y = 0, Safe Offset, Upright Yaw-Only)
   const postCount = 240;
-  const postGeo = new THREE.BoxGeometry(0.28, 0.85, 0.9);
+  const postGeo = new THREE.BoxGeometry(0.9, 0.85, 0.28);
   postGeo.translate(0, 0.425, 0);
   const postMat = new THREE.MeshStandardMaterial({
     color: 0x94a3b8,
@@ -1366,21 +2466,57 @@ export function buildRacingTrack(
 
   for (let i = 0; i < postCount; i++) {
     const s = (i / postCount) * TRACK_LENGTH;
-    evaluateTrackFrame(s, frame);
     const side = i % 2 === 0 ? 1 : -1;
-
-    dummy.position
-      .copy(frame.position)
-      .addScaledVector(frame.right, side * (ROAD_HALF_WIDTH + 0.65));
-    const look = new THREE.Vector3().copy(dummy.position).add(frame.tangent);
-    dummy.lookAt(look);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    postInstanced.setMatrixAt(i, dummy.matrix);
+    const latDist = MIN_SAFE_PROP_OFFSET + 0.55;
+    instScale.set(1, 1, 1);
+    computeValidatedPropPlacement(
+      s,
+      side,
+      latDist,
+      0.2,
+      0,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+    instMatrix.compose(instPos, instQuat, instScale);
+    postInstanced.setMatrixAt(i, instMatrix);
   }
   postInstanced.instanceMatrix.needsUpdate = true;
   postInstanced.computeBoundingSphere();
   group.add(postInstanced);
+
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'RoadsideGuardrailPosts',
+    mesh: postInstanced,
+    count: postCount,
+    inwardRadius: 0.2,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(0.9, 0.85, 0.28),
+  });
+
+  // ============================================================================
+  // 8. ONE-TIME PROP VALIDATION, AUTO-CORRECTION & DEBUG HELPER GROUP (KEY P)
+  // ============================================================================
+  validateAndCorrectTracksideProps(registeredProps, trackSamples);
+
+  const propDebugGroup = buildPropDebugHelperGroup(
+    registeredProps,
+    trackSamples,
+    geometriesToDispose,
+    materialsToDispose
+  );
+  group.add(propDebugGroup);
+
+  const togglePropDebug = (): boolean => {
+    propDebugGroup.visible = !propDebugGroup.visible;
+    return propDebugGroup.visible;
+  };
 
   const updateEnvironment = (elapsed: number, cameraPos: THREE.Vector3) => {
     // Keep sky dome centered on camera for infinite horizon feel
@@ -1402,6 +2538,8 @@ export function buildRacingTrack(
     asphaltTexture,
     boostPads,
     gantryLights,
+    propDebugGroup,
+    togglePropDebug,
     updateEnvironment,
     dispose,
   };

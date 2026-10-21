@@ -11,69 +11,83 @@ export function createAsphaltTexture(
   canvas.height = 1024;
   const ctx = canvas.getContext('2d')!;
 
-  // Base dark asphalt
-  ctx.fillStyle = isMidnight ? '#10141E' : '#1A1D24';
+  // Base sun-baked motorsport asphalt (calibrated for ACESFilmic tone mapping so road doesn't crush to black)
+  ctx.fillStyle = isMidnight ? '#181E2C' : '#2D323B';
   ctx.fillRect(0, 0, 1024, 1024);
 
-  // Subtle aggregate grain & racing line rubber marks
-  for (let i = 0; i < 18000; i++) {
+  // Fine mineral aggregate grain & micro-texture across the asphalt
+  for (let i = 0; i < 22000; i++) {
     const x = Math.random() * 1024;
     const y = Math.random() * 1024;
-    const v = 22 + Math.floor(Math.random() * 20);
-    ctx.fillStyle = `rgba(${v}, ${v + 2}, ${v + 6}, 0.28)`;
+    const v = isMidnight
+      ? 28 + Math.floor(Math.random() * 24)
+      : 52 + Math.floor(Math.random() * 30);
+    ctx.fillStyle = `rgba(${v}, ${v + 3}, ${v + 8}, 0.32)`;
     ctx.fillRect(x, y, 2, 3);
   }
 
-  // Darker tire wear tracks in the two main racing lanes
+  // Darker rubbered-in racing line tracks in the two main lanes
   const gradLeft = ctx.createLinearGradient(180, 0, 420, 0);
   gradLeft.addColorStop(0, 'rgba(0,0,0,0)');
-  gradLeft.addColorStop(0.5, 'rgba(5,7,12,0.38)');
+  gradLeft.addColorStop(0.5, 'rgba(10,12,18,0.28)');
   gradLeft.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = gradLeft;
   ctx.fillRect(180, 0, 240, 1024);
 
   const gradRight = ctx.createLinearGradient(604, 0, 844, 0);
   gradRight.addColorStop(0, 'rgba(0,0,0,0)');
-  gradRight.addColorStop(0.5, 'rgba(5,7,12,0.38)');
+  gradRight.addColorStop(0.5, 'rgba(10,12,18,0.28)');
   gradRight.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = gradRight;
   ctx.fillRect(604, 0, 240, 1024);
 
-  // Sandy dust shoulder bleed near outer curbs
+  // Sandy dust shoulder bleed near outer curbs (warm ochre instead of heavy red)
   if (!isMidnight) {
-    const leftDust = ctx.createLinearGradient(44, 0, 130, 0);
-    leftDust.addColorStop(0, 'rgba(180, 95, 55, 0.25)');
-    leftDust.addColorStop(1, 'rgba(180, 95, 55, 0)');
+    const leftDust = ctx.createLinearGradient(44, 0, 145, 0);
+    leftDust.addColorStop(0, 'rgba(204, 132, 72, 0.34)');
+    leftDust.addColorStop(1, 'rgba(204, 132, 72, 0)');
     ctx.fillStyle = leftDust;
-    ctx.fillRect(44, 0, 86, 1024);
+    ctx.fillRect(44, 0, 101, 1024);
 
-    const rightDust = ctx.createLinearGradient(1024 - 130, 0, 1024 - 44, 0);
-    rightDust.addColorStop(0, 'rgba(180, 95, 55, 0)');
-    rightDust.addColorStop(1, 'rgba(180, 95, 55, 0.25)');
+    const rightDust = ctx.createLinearGradient(1024 - 145, 0, 1024 - 44, 0);
+    rightDust.addColorStop(0, 'rgba(204, 132, 72, 0)');
+    rightDust.addColorStop(1, 'rgba(204, 132, 72, 0.34)');
     ctx.fillStyle = rightDust;
-    ctx.fillRect(1024 - 130, 0, 86, 1024);
+    ctx.fillRect(1024 - 145, 0, 101, 1024);
   }
 
-  // Outer rumble curbs (left & right edges) - toned down secondary white so kerbs never blow out
+  // Outer rumble kerbs (left & right edges) - slightly darker red (#B91C1C) and warm off-white (#D6D3CD) so they never clip to pure white
+  const safePrimaryCurb =
+    curbPrimaryHex.toUpperCase() === '#EF4444' ||
+    curbPrimaryHex.toUpperCase() === '#EA580C'
+      ? '#B91C1C'
+      : curbPrimaryHex;
   const safeSecondaryWhite =
-    curbSecondaryHex.toUpperCase() === '#F8FAFC' ? '#BAC4D4' : curbSecondaryHex;
+    curbSecondaryHex.toUpperCase() === '#F8FAFC' ||
+    curbSecondaryHex.toUpperCase() === '#E2E8F0'
+      ? '#D6D3CD'
+      : curbSecondaryHex;
   const stripeCount = 8;
   const stripeHeight = 1024 / stripeCount;
   for (let i = 0; i < stripeCount; i++) {
-    ctx.fillStyle = i % 2 === 0 ? curbPrimaryHex : safeSecondaryWhite;
+    ctx.fillStyle = i % 2 === 0 ? safePrimaryCurb : safeSecondaryWhite;
     ctx.fillRect(0, i * stripeHeight, 44, stripeHeight);
     ctx.fillRect(1024 - 44, i * stripeHeight, 44, stripeHeight);
+    // Subtle dark bevel seam between kerb blocks so white blocks keep surface detail
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.22)';
+    ctx.fillRect(0, i * stripeHeight, 44, 4);
+    ctx.fillRect(1024 - 44, i * stripeHeight, 44, 4);
   }
 
   // Controlled matte track boundary lines (no HDR blowout)
-  ctx.fillStyle = isMidnight ? '#2563EB' : '#94A3B8';
+  ctx.fillStyle = isMidnight ? '#38BDF8' : '#CBD5E1';
   ctx.fillRect(48, 0, 10, 1024);
   ctx.fillRect(1024 - 58, 0, 10, 1024);
 
   // Center dashed lane dividers (3 lanes)
   ctx.fillStyle = isMidnight
-    ? 'rgba(56, 189, 248, 0.42)'
-    : 'rgba(148, 163, 184, 0.42)';
+    ? 'rgba(56, 189, 248, 0.48)'
+    : 'rgba(203, 213, 225, 0.48)';
   for (let i = 0; i < 4; i++) {
     const y = i * 256 + 36;
     ctx.fillRect(341 - 5, y, 10, 140);
@@ -90,7 +104,7 @@ export function createAsphaltTexture(
 }
 
 /**
- * Layered Red / Orange / Tan sedimentary sandstone banding texture for canyon mesas, pillars, arches & boulders.
+ * Layered Warm Orange / Amber / Ochre sedimentary sandstone banding texture with cool slate shadow striations.
  */
 export function createSandstoneBandedTexture(
   maxAnisotropy: number
@@ -102,29 +116,29 @@ export function createSandstoneBandedTexture(
 
   const grad = ctx.createLinearGradient(0, 0, 0, 512);
   const bands: [number, string][] = [
-    [0.0, '#7C2D12'],
-    [0.12, '#9A3412'],
-    [0.22, '#C2410C'],
+    [0.0, '#784421'],
+    [0.12, '#9A5B28'],
+    [0.22, '#C27129'],
     [0.31, '#D97706'],
     [0.39, '#B45309'],
-    [0.48, '#7C2D12'],
+    [0.48, '#854D27'],
     [0.58, '#EA580C'],
     [0.67, '#F59E0B'],
-    [0.76, '#9A3412'],
-    [0.88, '#B45309'],
-    [1.0, '#6B2111'],
+    [0.76, '#A15C27'],
+    [0.88, '#B46529'],
+    [1.0, '#5C3A21'],
   ];
   bands.forEach(([stop, hex]) => grad.addColorStop(stop, hex));
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, 512, 512);
 
-  // Fine horizontal sedimentary striations
+  // Fine horizontal sedimentary striations with warm highlights & cool slate-shadow crevices
   for (let y = 0; y < 512; y += 3) {
-    const alpha = 0.06 + (Math.sin(y * 0.25) * 0.5 + 0.5) * 0.12;
+    const alpha = 0.06 + (Math.sin(y * 0.25) * 0.5 + 0.5) * 0.11;
     ctx.fillStyle =
       y % 6 === 0
         ? `rgba(254, 215, 170, ${alpha})`
-        : `rgba(67, 20, 7, ${alpha})`;
+        : `rgba(30, 41, 59, ${alpha})`;
     ctx.fillRect(0, y, 512, 2);
   }
 
@@ -135,7 +149,7 @@ export function createSandstoneBandedTexture(
     ctx.fillStyle =
       Math.random() > 0.5
         ? 'rgba(255,237,213,0.08)'
-        : 'rgba(40,12,5,0.12)';
+        : 'rgba(30,41,59,0.12)';
     ctx.fillRect(x, y, 3, 2);
   }
 
@@ -150,7 +164,7 @@ export function createSandstoneBandedTexture(
 
 /**
  * Sand/dirt ground texture with multi-scale noise variation, coarse gravel patches, and mineral flecks
- * for a subtle moonlit sheen.
+ * for warm orange-ochre highlights and cool slate shadows.
  */
 export function createDesertSandGroundTexture(
   maxAnisotropy: number,
@@ -165,7 +179,7 @@ export function createDesertSandGroundTexture(
   ctx.fillStyle = baseHex;
   ctx.fillRect(0, 0, 512, 512);
 
-  // 1. Multi-scale organic noise blotches (light tan, deep terracotta, and cool moonlit slate-ochre)
+  // 1. Multi-scale organic noise blotches (warm amber-tan, ochre, and cool slate shadow pockets)
   for (let i = 0; i < 280; i++) {
     const x = Math.random() * 512;
     const y = Math.random() * 512;
@@ -175,10 +189,10 @@ export function createDesertSandGroundTexture(
       g.addColorStop(
         0,
         i % 3 === 0
-          ? 'rgba(217, 119, 6, 0.24)'
+          ? 'rgba(245, 158, 11, 0.24)'
           : i % 3 === 1
-            ? 'rgba(72, 24, 12, 0.28)'
-            : 'rgba(186, 200, 224, 0.14)'
+            ? 'rgba(45, 55, 72, 0.24)'
+            : 'rgba(186, 200, 224, 0.16)'
       );
     } else {
       g.addColorStop(

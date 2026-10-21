@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import {
   CameraMode,
   CAR_LIVERIES,
@@ -18,8 +18,10 @@ import {
 } from '../types/racing';
 import {
   applyLiveryToCarRig,
+  BLOOM_LAYER,
   buildCompositeHypercar,
   CompositeCarRig,
+  createStudioEnvironmentTexture,
 } from '../three/carBuilder';
 import {
   createContactShadowTexture,
@@ -60,12 +62,14 @@ interface RacingCanvasProps {
   onStatusChange: (status: RaceStatus) => void;
 }
 
-// Custom lightweight Color Grading (warm highlights, cool shadows) + Subtle Vignette ShaderPass
+// Custom Selective Bloom Composite + Color Grading (warm highlights, cool shadows) + Subtle Vignette ShaderPass
 const CanyonGradeVignetteShader = {
   uniforms: {
     tDiffuse: { value: null },
+    tBloom: { value: null },
+    uBloomEnabled: { value: 1.0 },
     uVignetteOffset: { value: 1.05 },
-    uVignetteDarkness: { value: 0.42 },
+    uVignetteDarkness: { value: 0.36 },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -76,29 +80,29 @@ const CanyonGradeVignetteShader = {
   `,
   fragmentShader: `
     uniform sampler2D tDiffuse;
+    uniform sampler2D tBloom;
+    uniform float uBloomEnabled;
     uniform float uVignetteOffset;
     uniform float uVignetteDarkness;
     varying vec2 vUv;
 
     void main() {
-      vec4 texel = texture2D(tDiffuse, vUv);
-      vec3 col = texel.rgb;
+      vec4 baseTexel = texture2D(tDiffuse, vUv);
+      vec3 bloomCol = texture2D(tBloom, vUv).rgb * uBloomEnabled;
+      vec3 col = baseTexel.rgb + bloomCol;
 
-      // Luminance for split-toning (warm golden highlights, cool twilight-violet shadows)
+      // Luminance for subtle split-toning (warm golden-orange highlights, cool purple-slate shadows)
       float lum = dot(col, vec3(0.299, 0.587, 0.114));
-      vec3 coolShadows = vec3(0.93, 0.94, 1.05);
-      vec3 warmHighlights = vec3(1.06, 1.01, 0.94);
-      col *= mix(coolShadows, warmHighlights, smoothstep(0.15, 0.85, lum));
-
-      // Subtle contrast S-curve polish
-      col = mix(col, smoothstep(0.0, 1.0, col), 0.12);
+      vec3 coolShadows = vec3(0.92, 0.93, 1.02);
+      vec3 warmHighlights = vec3(1.02, 0.98, 0.94);
+      col *= mix(coolShadows, warmHighlights, smoothstep(0.14, 0.84, lum));
 
       // Soft optical vignette
       vec2 uv = (vUv - vec2(0.5)) * vec2(uVignetteOffset);
       float vig = clamp(1.0 - dot(uv, uv) * uVignetteDarkness, 0.0, 1.0);
       col *= vig;
 
-      gl_FragColor = vec4(col, texel.a);
+      gl_FragColor = vec4(col, baseTexel.a);
     }
   `,
 };
@@ -240,7 +244,7 @@ const AI_DRIVERS = [
   { id: 'ai-2', name: 'L. Leclerc', code: 'LEC', liveryIdx: 2, baseSpeed: 73.2 },
   { id: 'ai-3', name: 'K. Sato', code: 'SAT', liveryIdx: 3, baseSpeed: 71.8 },
   { id: 'ai-4', name: 'C. Norris', code: 'NOR', liveryIdx: 4, baseSpeed: 70.4 },
-  { id: 'ai-5', name: 'E. Vance', code: 'VAN', liveryIdx: 0, baseSpeed: 68.8 },
+  { id: 'ai-5', name: 'E. Vance', code: 'VAN', liveryIdx: 5, baseSpeed: 68.8 },
 ];
 
 export const RacingCanvas: React.FC<RacingCanvasProps> = ({
@@ -335,6 +339,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     ctx.hemiLight.groundColor.set(config.hemiGroundHex);
     ctx.hemiLight.intensity = config.hemiIntensity;
 
+    const wasDebugVisible = ctx.builtTrack?.propDebugGroup.visible ?? false;
     if (ctx.builtTrack) {
       ctx.scene.remove(ctx.builtTrack.group);
       ctx.builtTrack.dispose();
@@ -342,6 +347,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
     const maxAniso = ctx.renderer.capabilities.getMaxAnisotropy();
     const newTrack = buildRacingTrack(config, maxAniso);
+    if (wasDebugVisible) {
+      newTrack.togglePropDebug();
+    }
     ctx.scene.add(newTrack.group);
     ctx.builtTrack = newTrack;
 
@@ -389,7 +397,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 0.96;
+    renderer.toneMappingExposure = 0.82;
     renderer.setPixelRatio(isHeadless ? 1 : Math.min(window.devicePixelRatio, 2));
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.shadowMap.enabled = !isHeadless;
@@ -398,28 +406,76 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
 
-    // Post-Processing Pipeline (Light-Only Bloom + Warm/Cool Color Grading + Vignette)
+    // Selective Bloom Post-Processing Pipeline:
+    // 1) bloomComposer renders ONLY meshes on BLOOM_LAYER (brake light strip, headlights, lamps, neon signs, nitro flames)
+    //    while non-bloom meshes stay black in the depth buffer for accurate occlusion, so white car paint, kerbs & road markings never bloom.
+    // 2) finalComposer composites the selective bloom texture, applies subtle sunset grading, and runs OutputPass (ACESFilmic + sRGB).
+    const bloomLayer = new THREE.Layers();
+    bloomLayer.set(BLOOM_LAYER);
+    const darkOcclusionMaterial = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const savedMaterials = new Map<string, THREE.Material | THREE.Material[]>();
+    const hiddenNonBloomObjects: THREE.Object3D[] = [];
+    let bloomEnabled = true;
+
+    let bloomComposer: EffectComposer | null = null;
     let composer: EffectComposer | null = null;
     let bloomPass: UnrealBloomPass | null = null;
+    let gradeVignettePass: ShaderPass | null = null;
+
     if (!isHeadless) {
-      composer = new EffectComposer(renderer);
       const renderPass = new RenderPass(scene, camera);
-      composer.addPass(renderPass);
+
+      bloomComposer = new EffectComposer(renderer);
+      bloomComposer.renderToScreen = false;
+      bloomComposer.addPass(renderPass);
 
       bloomPass = new UnrealBloomPass(
         new THREE.Vector2(
           Math.max(1, Math.floor(container.clientWidth * 0.5)),
           Math.max(1, Math.floor(container.clientHeight * 0.5))
         ),
-        0.20, // reduced bloom intensity so kerbs and white lines never blow out
-        0.32, // tight halo radius
-        1.08 // raised HDR threshold: only emissive lamps, brake lights & sun glow
+        0.24, // low, controlled bloom strength so glow is tight and clean
+        0.22, // compact bloom radius
+        0.92 // high threshold (>= 0.9): only brake lights, headlights, lamps & neon glow
       );
-      composer.addPass(bloomPass);
+      bloomComposer.addPass(bloomPass);
 
-      const gradeVignettePass = new ShaderPass(CanyonGradeVignetteShader);
+      composer = new EffectComposer(renderer);
+      composer.addPass(renderPass);
+
+      gradeVignettePass = new ShaderPass(CanyonGradeVignetteShader);
+      gradeVignettePass.uniforms.tBloom.value =
+        bloomComposer.renderTarget2.texture;
+      gradeVignettePass.uniforms.uBloomEnabled.value = 1.0;
       composer.addPass(gradeVignettePass);
+
+      const outputPass = new OutputPass();
+      composer.addPass(outputPass);
     }
+
+    const darkenNonBloomed = (obj: THREE.Object3D) => {
+      if (
+        (obj instanceof THREE.Points || obj instanceof THREE.LineSegments) &&
+        !bloomLayer.test(obj.layers)
+      ) {
+        if (obj.visible) {
+          obj.visible = false;
+          hiddenNonBloomObjects.push(obj);
+        }
+        return;
+      }
+      if (obj instanceof THREE.Mesh && !bloomLayer.test(obj.layers)) {
+        savedMaterials.set(obj.uuid, obj.material);
+        obj.material = darkOcclusionMaterial;
+      }
+    };
+
+    const restoreMaterialsAfterBloom = (obj: THREE.Object3D) => {
+      const origMat = savedMaterials.get(obj.uuid);
+      if (origMat !== undefined && obj instanceof THREE.Mesh) {
+        obj.material = origMat;
+      }
+    };
 
     // WebGL Context Loss & Restoration Safety
     const handleContextLost = (e: Event) => {
@@ -432,12 +488,12 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     renderer.domElement.addEventListener('webglcontextlost', handleContextLost);
     renderer.domElement.addEventListener('webglcontextrestored', handleContextRestored);
 
-    // Studio Environment Reflection (RoomEnvironment + PMREMGenerator)
-    const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-    pmremGenerator.dispose();
+    // Warm Low-Dynamic-Range Sunset Reflection Map (replaces HDR RoomEnvironment so white clearcoat never blows out)
+    const sunsetEnvTex = createStudioEnvironmentTexture();
+    scene.environment = sunsetEnvTex;
+    scene.environmentIntensity = 0.42;
 
-    // 3-Point Studio & Sunset Lighting Rig (Long Directional Shadows + Warm Rim Light)
+    // Sunset Lighting Rig: Soft Hemisphere Fill + Warm Golden-Orange Directional Sun aligned with Sky Sun
     const hemiLight = new THREE.HemisphereLight(
       initialConfig.hemiSkyHex,
       initialConfig.hemiGroundHex,
@@ -449,13 +505,13 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       initialConfig.sunColorHex,
       initialConfig.sunIntensity
     );
-    // Low sunset angle for long dramatic shadows across the road and rocks
-    sunLight.position.set(-75, 42, -105);
+    // Aligned with low sunset sky sun direction (-0.52, 0.135, -0.84)
+    sunLight.position.set(-104, 27, -168);
     sunLight.castShadow = !isHeadless;
     sunLight.shadow.mapSize.width = 1024;
     sunLight.shadow.mapSize.height = 1024;
     sunLight.shadow.camera.near = 10;
-    sunLight.shadow.camera.far = 280;
+    sunLight.shadow.camera.far = 320;
     const d = 44;
     sunLight.shadow.camera.left = -d;
     sunLight.shadow.camera.right = d;
@@ -466,9 +522,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     scene.add(sunLight);
     scene.add(sunLight.target);
 
-    // Warm Rim Light opposing the key light to sculpt car bevels and rock edges
-    const rimLight = new THREE.DirectionalLight(0xfdba74, 1.45);
-    rimLight.position.set(65, 28, 85);
+    // Gentle side-grazing rim light (low intensity so it never glares off the roof or road)
+    const rimLight = new THREE.DirectionalLight(0xfdba74, 0.28);
+    rimLight.position.set(55, 16, 25);
     scene.add(rimLight);
     scene.add(rimLight.target);
 
@@ -813,6 +869,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       const mesh = new THREE.Mesh(tracerGeo, playerTracerMat);
       mesh.visible = false;
       mesh.frustumCulled = false;
+      mesh.layers.enable(BLOOM_LAYER);
       scene.add(mesh);
       bulletPool.push({
         active: false,
@@ -916,7 +973,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       fin2.rotation.z = Math.PI * 0.5;
       grp.add(fin1);
       grp.add(fin2);
-      grp.add(new THREE.Mesh(missileFlareGeo, missileFlareMat));
+      const flareMesh = new THREE.Mesh(missileFlareGeo, missileFlareMat);
+      flareMesh.layers.enable(BLOOM_LAYER);
+      grp.add(flareMesh);
       grp.visible = false;
       scene.add(grp);
       missilePool.push({
@@ -957,6 +1016,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       const mfMesh = new THREE.Mesh(muzzleFlashGeo, mfMat);
       mfMesh.visible = false;
       mfMesh.frustumCulled = false;
+      mfMesh.layers.enable(BLOOM_LAYER);
       scene.add(mfMesh);
       muzzleFlashPool.push({
         active: false,
@@ -1070,15 +1130,22 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       coreGroup.position.y = 1.05;
 
       if (spot.type === 'repair') {
-        coreGroup.add(new THREE.Mesh(pickupCrossVGeo, repairPickupMat));
-        coreGroup.add(new THREE.Mesh(pickupCrossHGeo, repairPickupMat));
+        const vBar = new THREE.Mesh(pickupCrossVGeo, repairPickupMat);
+        const hBar = new THREE.Mesh(pickupCrossHGeo, repairPickupMat);
+        vBar.layers.enable(BLOOM_LAYER);
+        hBar.layers.enable(BLOOM_LAYER);
+        coreGroup.add(vBar, hBar);
         const ring = new THREE.Mesh(pickupRingGeo, repairRingMat);
         ring.position.y = 0.08;
+        ring.layers.enable(BLOOM_LAYER);
         group.add(ring);
       } else {
-        coreGroup.add(new THREE.Mesh(pickupAmmoOctGeo, ammoPickupMat));
+        const oct = new THREE.Mesh(pickupAmmoOctGeo, ammoPickupMat);
+        oct.layers.enable(BLOOM_LAYER);
+        coreGroup.add(oct);
         const ring = new THREE.Mesh(pickupRingGeo, ammoRingMat);
         ring.position.y = 0.08;
+        ring.layers.enable(BLOOM_LAYER);
         group.add(ring);
       }
 
@@ -1483,6 +1550,24 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         playerState.spinYawVelocity = 0;
         playerState.spinOffsetAngle = 0;
       }
+      if ( e.code === 'KeyP' && !e.repeat ) {
+        const isDebugActive =
+          sceneObjectsRef.current?.builtTrack?.togglePropDebug() ?? false;
+        triggerScoreEvent(
+          isDebugActive ? 'PROP DEBUG: ON (KEY P)' : 'PROP DEBUG: OFF'
+        );
+      }
+      if (e.code === 'KeyB' && !e.repeat) {
+        bloomEnabled = !bloomEnabled;
+        if (gradeVignettePass) {
+          gradeVignettePass.uniforms.uBloomEnabled.value = bloomEnabled
+            ? 1.0
+            : 0.0;
+        }
+        triggerScoreEvent(
+          bloomEnabled ? 'BLOOM PASS: ON (KEY B)' : 'BLOOM PASS: OFF (KEY B)'
+        );
+      }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       keys[e.code] = false;
@@ -1515,6 +1600,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      if (bloomComposer) {
+        bloomComposer.setSize(w, h);
+      }
       if (composer) {
         composer.setSize(w, h);
       }
@@ -1542,7 +1630,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       rival.hitSlowTimer = 0.5; // brief 0.5s slowdown on hit
       rig.paintMaterials.forEach((mat) => {
         mat.emissive.setHex(0xffffff);
-        mat.emissiveIntensity = 1.65;
+        mat.emissiveIntensity = 0.35; // capped subtle hit flash so car body never blooms
       });
 
       spawnCollisionSparks(
@@ -1599,7 +1687,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       soundEngine.playHitConfirm();
       playerRig.paintMaterials.forEach((mat) => {
         mat.emissive.setHex(0xef4444);
-        mat.emissiveIntensity = 1.6;
+        mat.emissiveIntensity = 0.35; // capped subtle hit flash so player paint never blooms
       });
 
       if (playerState.hp <= 0) {
@@ -2253,9 +2341,16 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         w.rotation.x -= wheelSpinDelta;
       });
 
-      // Brake Light Intensity & Nitro Exhaust Flames
+      // Brake Light Intensity (only on tailStripMesh; lowered to 2.5 when braking and 0.85 idle so it never causes white glare)
       playerRig.brakeLightMaterial.emissiveIntensity =
-        brakeInput > 0 ? 4.8 : 1.4;
+        brakeInput > 0 ? 2.5 : 0.85;
+      const highSpeedExhaustGlow = THREE.MathUtils.clamp(
+        (Math.abs(playerState.speed) - 34) / 42,
+        0,
+        1
+      );
+      playerRig.exhaustGlowMaterial.emissiveIntensity =
+        0.05 + highSpeedExhaustGlow * 0.85 + (isBoosting ? 1.1 : 0);
       const flameScale = isBoosting
         ? 0.9 + Math.sin(elapsed * 45) * 0.25
         : 0.001;
@@ -2634,6 +2729,12 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         rig.wheelSpinMeshes.forEach((w) => {
           w.rotation.x -= rSpin;
         });
+
+        // Rival brake light glow on sharp corners & subtle high-speed exhaust tip glow
+        rig.brakeLightMaterial.emissiveIntensity =
+          Math.abs(_rivalFrame.curvature) > 0.012 ? 2.2 : 0.85;
+        rig.exhaustGlowMaterial.emissiveIntensity =
+          0.05 + THREE.MathUtils.clamp((rival.speed - 34) / 42, 0, 1) * 0.8;
 
         // AI SHOOTING BACK: Rivals occasionally shoot when player is ahead and in front,
         // with difficulty-scaled accuracy cone, fire rate, and reload delay between bursts.
@@ -3184,18 +3285,19 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         sparkPosAttr.needsUpdate = true;
       }
 
-      // Keep Sunset Key Light (Long Shadows) & Warm Rim Light centered on Player Car
+      // Keep Sunset Directional Key Light aligned with the low sun in the sky shader (-0.52, 0.135, -0.84)
       sunLight.position.set(
-        _carWorldPos.x - 65,
-        _carWorldPos.y + 38,
-        _carWorldPos.z - 90
+        _carWorldPos.x - 104,
+        _carWorldPos.y + 27,
+        _carWorldPos.z - 168
       );
       sunLight.target.position.copy(_carWorldPos);
 
+      // Position gentle side-grazing rim light so it sculpts the body without reflecting into the chase camera off the roof or road
       rimLight.position.set(
-        _carWorldPos.x + 55,
-        _carWorldPos.y + 24,
-        _carWorldPos.z + 75
+        _carWorldPos.x + _carRight.x * 28,
+        _carWorldPos.y + 12,
+        _carWorldPos.z + _carRight.z * 28
       );
       rimLight.target.position.copy(_carWorldPos);
 
@@ -3355,8 +3457,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         currentStatus === 'paused' || currentStatus === 'ready'
       );
 
-      // Render Scene via Post-Processing Composer (or direct Renderer fallback)
-      if (composer) {
+      // Render Scene via Selective Bloom Composer + Final Tone-Mapped Output Composer
+      if (composer && bloomComposer) {
+        if (bloomEnabled) {
+          const prevBg = scene.background;
+          scene.background = null;
+          scene.traverse(darkenNonBloomed);
+          bloomComposer.render();
+          scene.traverse(restoreMaterialsAfterBloom);
+          savedMaterials.clear();
+          for (let i = 0; i < hiddenNonBloomObjects.length; i++) {
+            hiddenNonBloomObjects[i].visible = true;
+          }
+          hiddenNonBloomObjects.length = 0;
+          scene.background = prevBg;
+        }
         composer.render();
       } else {
         renderer.render(scene, camera);
@@ -3578,6 +3693,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       hpFillGeo.dispose();
       lockBoxGeo.dispose();
       lockBoxMat.dispose();
+      darkOcclusionMaterial.dispose();
+      sunsetEnvTex.dispose();
+      bloomComposer?.dispose();
       composer?.dispose();
       renderer.dispose();
     };
