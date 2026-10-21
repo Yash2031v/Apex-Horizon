@@ -543,6 +543,146 @@ class RacingSoundEngine {
   }
 
   /**
+   * Minecraft-Style Blocky Hit Sound: Short low thump with a quick crisp noise burst.
+   */
+  public playBlockyHit(isHeavyMissile: boolean = false): void {
+    if (this.isMuted) return;
+    this.init();
+    if (!this.ctx || !this.masterGain || !this.sharedNoiseBuffer) return;
+
+    try {
+      const now = this.ctx.currentTime;
+      const dur = isHeavyMissile ? 0.16 : 0.11;
+
+      // 1. Low blocky thump oscillator
+      const thumpOsc = this.ctx.createOscillator();
+      const thumpGain = this.ctx.createGain();
+      thumpOsc.type = 'triangle';
+      thumpOsc.frequency.setValueAtTime(isHeavyMissile ? 145 : 175, now);
+      thumpOsc.frequency.exponentialRampToValueAtTime(
+        isHeavyMissile ? 42 : 58,
+        now + dur
+      );
+
+      thumpGain.gain.setValueAtTime(isHeavyMissile ? 0.34 : 0.24, now);
+      thumpGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+      thumpOsc.connect(thumpGain);
+      thumpGain.connect(this.masterGain);
+      thumpOsc.start(now);
+      thumpOsc.stop(now + dur + 0.01);
+
+      // 2. Quick noise burst
+      const noiseSrc = this.ctx.createBufferSource();
+      noiseSrc.buffer = this.sharedNoiseBuffer;
+      const filter = this.ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(isHeavyMissile ? 920 : 1280, now);
+      filter.Q.setValueAtTime(2.4, now);
+
+      const noiseGain = this.ctx.createGain();
+      noiseGain.gain.setValueAtTime(isHeavyMissile ? 0.26 : 0.18, now);
+      noiseGain.gain.exponentialRampToValueAtTime(0.001, now + dur * 0.75);
+
+      noiseSrc.connect(filter);
+      filter.connect(noiseGain);
+      noiseGain.connect(this.masterGain);
+      noiseSrc.start(now, Math.random() * 1.2, dur);
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
+   * Player Hurt Sound: Higher-pitched blocky hurt crunch + low thump + quick noise burst.
+   */
+  public playPlayerHurt(isHeavy: boolean = false): void {
+    if (this.isMuted) return;
+    this.init();
+    if (!this.ctx || !this.masterGain || !this.sharedNoiseBuffer) return;
+
+    try {
+      const now = this.ctx.currentTime;
+      const dur = isHeavy ? 0.18 : 0.13;
+
+      // Higher-pitched retro hurt pitch drop
+      const hurtOsc = this.ctx.createOscillator();
+      const hurtGain = this.ctx.createGain();
+      hurtOsc.type = 'square';
+      hurtOsc.frequency.setValueAtTime(isHeavy ? 540 : 620, now);
+      hurtOsc.frequency.setValueAtTime(isHeavy ? 380 : 440, now + 0.04);
+      hurtOsc.frequency.exponentialRampToValueAtTime(195, now + dur);
+
+      hurtGain.gain.setValueAtTime(0.16, now);
+      hurtGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+      hurtOsc.connect(hurtGain);
+      hurtGain.connect(this.masterGain);
+      hurtOsc.start(now);
+      hurtOsc.stop(now + dur + 0.01);
+
+      // Accompanying low thump + noise burst
+      this.playBlockyHit(isHeavy);
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
+   * Progressive Car Damage Stage "Break" Sound (at 75%, 50%, and 25% HP):
+   * Crisp Minecraft-style block crack/shatter crunch.
+   */
+  public playDamageStageBreak(stage: number = 1): void {
+    if (this.isMuted) return;
+    this.init();
+    if (!this.ctx || !this.masterGain || !this.sharedNoiseBuffer) return;
+
+    try {
+      const now = this.ctx.currentTime;
+      const baseFreq = stage === 3 ? 240 : stage === 2 ? 310 : 380;
+
+      for (let g = 0; g < 3; g++) {
+        const offset = g * 0.042;
+        const grainDur = 0.075;
+
+        // Blocky square crackle grain
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(baseFreq - g * 48, now + offset);
+        osc.frequency.exponentialRampToValueAtTime(75, now + offset + grainDur);
+
+        gain.gain.setValueAtTime(0.18, now + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + offset + grainDur);
+
+        osc.connect(gain);
+        gain.connect(this.masterGain);
+        osc.start(now + offset);
+        osc.stop(now + offset + grainDur + 0.01);
+
+        // Crisp noise crunch grain
+        const noiseSrc = this.ctx.createBufferSource();
+        noiseSrc.buffer = this.sharedNoiseBuffer;
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.setValueAtTime(880 + g * 280, now + offset);
+        filter.Q.setValueAtTime(3.0, now + offset);
+
+        const nGain = this.ctx.createGain();
+        nGain.gain.setValueAtTime(0.22, now + offset);
+        nGain.gain.exponentialRampToValueAtTime(0.001, now + offset + grainDur);
+
+        noiseSrc.connect(filter);
+        filter.connect(nGain);
+        nGain.connect(this.masterGain);
+        noiseSrc.start(now + offset, Math.random() * 1.1, grainDur);
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
    * Floating Track Pickup Collected: Rising crystalline synth arpeggio for Repair (+30 HP) or Ammo (+Missiles).
    */
   public playPickup(type: 'repair' | 'ammo'): void {
@@ -579,4 +719,5 @@ class RacingSoundEngine {
 }
 
 export const soundEngine = new RacingSoundEngine();
+
 

@@ -14,6 +14,13 @@ export interface CompositeCarRig {
   paintMaterials: THREE.MeshPhysicalMaterial[];
   accentMaterials: THREE.MeshStandardMaterial[];
   rimMaterials: THREE.MeshStandardMaterial[];
+  bodyTrimMaterial: THREE.MeshStandardMaterial;
+  basePaintColor: THREE.Color;
+  baseAccentColor: THREE.Color;
+  baseTrimColor: THREE.Color;
+  damageCrackGroup: THREE.Group;
+  damageCrackMaterial: THREE.MeshBasicMaterial;
+  currentDamageStage: number;
   brakeLightMaterial: THREE.MeshStandardMaterial;
   exhaustGlowMaterial: THREE.MeshStandardMaterial;
   frontWheelPivots: THREE.Group[];
@@ -101,9 +108,114 @@ interface SharedMuscleCoupeAssets {
   chromeExhaustMat: THREE.MeshPhysicalMaterial;
   flameMat: THREE.MeshBasicMaterial;
   doorSeamMat: THREE.LineBasicMaterial;
+  damageCrackTextures: [
+    THREE.CanvasTexture,
+    THREE.CanvasTexture,
+    THREE.CanvasTexture,
+  ];
+  hoodCrackGeo: THREE.PlaneGeometry;
+  roofCrackGeo: THREE.PlaneGeometry;
+  sideCrackGeo: THREE.PlaneGeometry;
+  rearCrackGeo: THREE.PlaneGeometry;
 }
 
 let _sharedAssets: SharedMuscleCoupeAssets | null = null;
+
+/**
+ * Generates a crisp Minecraft-style 32x32 pixel-art block crack & dent texture
+ * for stage 1 (<=75% HP), stage 2 (<=50% HP), and stage 3 (<=25% HP).
+ */
+function createBlockyDamageCrackTexture(stage: 1 | 2 | 3): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, 64, 64);
+
+  const px = 4; // 16x16 blocky pixel grid scaled to 64x64
+  const drawPixel = (gx: number, gy: number, color: string) => {
+    if (gx < 0 || gx >= 16 || gy < 0 || gy >= 16) return;
+    ctx.fillStyle = color;
+    ctx.fillRect(gx * px, gy * px, px, px);
+  };
+
+  // Stage 1 (<= 75% HP): Initial blocky dark cracks & small dent patches
+  const stage1Pixels: [number, number, string][] = [
+    [7, 4, '#090D16'],
+    [8, 5, '#090D16'],
+    [8, 6, '#1E293B'],
+    [7, 7, '#090D16'],
+    [6, 8, '#090D16'],
+    [9, 7, '#1E293B'],
+    [10, 8, '#090D16'],
+    [5, 5, '#1E293B'],
+    [11, 5, '#090D16'],
+    [4, 10, '#090D16'],
+    [5, 11, '#1E293B'],
+  ];
+
+  // Stage 2 (<= 50% HP): Deeper branching pixel fissures & dark metal dent blocks
+  const stage2Pixels: [number, number, string][] = [
+    [6, 3, '#090D16'],
+    [5, 4, '#090D16'],
+    [4, 4, '#1E293B'],
+    [9, 4, '#090D16'],
+    [10, 4, '#1E293B'],
+    [6, 9, '#090D16'],
+    [5, 10, '#090D16'],
+    [3, 11, '#090D16'],
+    [8, 8, '#090D16'],
+    [8, 9, '#1E293B'],
+    [9, 10, '#090D16'],
+    [11, 9, '#090D16'],
+    [12, 10, '#1E293B'],
+    [12, 11, '#090D16'],
+    [3, 6, '#090D16'],
+    [4, 7, '#1E293B'],
+    [12, 6, '#090D16'],
+  ];
+
+  // Stage 3 (<= 25% HP): Heavy shattered Minecraft block cracks & darkchar patches
+  const stage3Pixels: [number, number, string][] = [
+    [2, 2, '#090D16'],
+    [3, 3, '#090D16'],
+    [4, 3, '#1E293B'],
+    [13, 2, '#090D16'],
+    [12, 3, '#090D16'],
+    [11, 4, '#1E293B'],
+    [7, 8, '#05070B'],
+    [8, 7, '#05070B'],
+    [7, 6, '#05070B'],
+    [6, 7, '#05070B'],
+    [2, 8, '#090D16'],
+    [3, 9, '#1E293B'],
+    [2, 12, '#090D16'],
+    [3, 13, '#090D16'],
+    [7, 11, '#090D16'],
+    [8, 12, '#090D16'],
+    [8, 13, '#1E293B'],
+    [10, 11, '#090D16'],
+    [11, 12, '#090D16'],
+    [13, 12, '#090D16'],
+    [13, 8, '#090D16'],
+    [14, 9, '#1E293B'],
+  ];
+
+  stage1Pixels.forEach(([x, y, c]) => drawPixel(x, y, c));
+  if (stage >= 2) {
+    stage2Pixels.forEach(([x, y, c]) => drawPixel(x, y, c));
+  }
+  if (stage >= 3) {
+    stage3Pixels.forEach(([x, y, c]) => drawPixel(x, y, c));
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
 
 /**
  * Helper: Creates a smooth beveled ExtrudeGeometry from a 2D side-profile Shape where:
@@ -963,6 +1075,27 @@ function getSharedMuscleCoupeAssets(): SharedMuscleCoupeAssets {
     opacity: 0.55,
   });
 
+  const damageCrackTextures: [
+    THREE.CanvasTexture,
+    THREE.CanvasTexture,
+    THREE.CanvasTexture,
+  ] = [
+    createBlockyDamageCrackTexture(1),
+    createBlockyDamageCrackTexture(2),
+    createBlockyDamageCrackTexture(3),
+  ];
+
+  const hoodCrackGeo = new THREE.PlaneGeometry(1.18, 1.15);
+  hoodCrackGeo.rotateX(-Math.PI / 2);
+
+  const roofCrackGeo = new THREE.PlaneGeometry(0.92, 0.95);
+  roofCrackGeo.rotateX(-Math.PI / 2);
+
+  const sideCrackGeo = new THREE.PlaneGeometry(1.35, 0.44);
+
+  const rearCrackGeo = new THREE.PlaneGeometry(1.12, 0.52);
+  rearCrackGeo.rotateX(-Math.PI / 2);
+
   _sharedAssets = {
     shadowGeo,
     lowerChassisGeo,
@@ -1036,6 +1169,11 @@ function getSharedMuscleCoupeAssets(): SharedMuscleCoupeAssets {
     chromeExhaustMat,
     flameMat,
     doorSeamMat,
+    damageCrackTextures,
+    hoodCrackGeo,
+    roofCrackGeo,
+    sideCrackGeo,
+    rearCrackGeo,
   };
 
   return _sharedAssets;
@@ -1098,8 +1236,9 @@ export function buildCompositeHypercar(
       ? DEFAULT_CAR_PAINT_HEX
       : paintColorHex;
 
+  const basePaintColor = new THREE.Color(resolvedPaintHex);
   const primaryPaintMat = new THREE.MeshPhysicalMaterial({
-    color: new THREE.Color(resolvedPaintHex),
+    color: basePaintColor.clone(),
     emissive: new THREE.Color(0x000000),
     emissiveIntensity: 0.0,
     metalness: Math.min(0.22, livery.metalness),
@@ -1111,8 +1250,9 @@ export function buildCompositeHypercar(
   });
   paintMaterials.push(primaryPaintMat);
 
+  const baseAccentColor = new THREE.Color(livery.accentHex);
   const accentMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(livery.accentHex),
+    color: baseAccentColor.clone(),
     metalness: 0.5,
     roughness: 0.32,
     emissive: new THREE.Color(0x000000),
@@ -1120,6 +1260,10 @@ export function buildCompositeHypercar(
     envMapIntensity: 0.4,
   });
   accentMaterials.push(accentMat);
+
+  // Per-car cloned body trim material so red hit flashes never mutate shared assets.darkTrimMat
+  const bodyTrimMat = assets.darkTrimMat.clone();
+  const baseTrimColor = bodyTrimMat.color.clone();
 
   // Metallic Chrome / Alloy Rim Material
   const rimMat = new THREE.MeshStandardMaterial({
@@ -1148,7 +1292,7 @@ export function buildCompositeHypercar(
 
   // Beveled Hood Heat-Extractor Vents
   [-0.27, 0.27].forEach((xSide) => {
-    const vent = new THREE.Mesh(assets.hoodVentGeo, assets.darkTrimMat);
+    const vent = new THREE.Mesh(assets.hoodVentGeo, bodyTrimMat);
     vent.position.set(xSide, 0.855, -1.36);
     vent.rotation.x = 0.09;
     vent.rotation.z = xSide < 0 ? 0.06 : -0.06;
@@ -1171,9 +1315,9 @@ export function buildCompositeHypercar(
   bodyTiltGroup.add(rearBlistersMesh);
 
   // Dark Wheel Arch Trims & Black Side Skirts
-  const frontArchTrimMesh = new THREE.Mesh(assets.wheelArchTrimFrontGeo, assets.darkTrimMat);
-  const rearArchTrimMesh = new THREE.Mesh(assets.wheelArchTrimRearGeo, assets.darkTrimMat);
-  const sideSkirtMesh = new THREE.Mesh(assets.sideSkirtGeo, assets.darkTrimMat);
+  const frontArchTrimMesh = new THREE.Mesh(assets.wheelArchTrimFrontGeo, bodyTrimMat);
+  const rearArchTrimMesh = new THREE.Mesh(assets.wheelArchTrimRearGeo, bodyTrimMat);
+  const sideSkirtMesh = new THREE.Mesh(assets.sideSkirtGeo, bodyTrimMat);
   bodyTiltGroup.add(frontArchTrimMesh, rearArchTrimMesh, sideSkirtMesh);
 
   // Dark Wheel-Well Inner Liners (recessed inward so the wide rear tires are unobstructed from behind)
@@ -1460,12 +1604,60 @@ export function buildCompositeHypercar(
     }
   });
 
+  // --- PROGRESSIVE MINECRAFT BLOCK CRACK & DENT OVERLAYS (75%, 50%, 25% HP) ---
+  const damageCrackMaterial = new THREE.MeshBasicMaterial({
+    map: assets.damageCrackTextures[0],
+    transparent: true,
+    opacity: 0.0,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+    side: THREE.DoubleSide,
+  });
+
+  const damageCrackGroup = new THREE.Group();
+  damageCrackGroup.visible = false;
+
+  const hoodCrackMesh = new THREE.Mesh(assets.hoodCrackGeo, damageCrackMaterial);
+  hoodCrackMesh.position.set(0, 0.905, -1.22);
+  hoodCrackMesh.rotation.x = 0.085;
+  damageCrackGroup.add(hoodCrackMesh);
+
+  const roofCrackMesh = new THREE.Mesh(assets.roofCrackGeo, damageCrackMaterial);
+  roofCrackMesh.position.set(0, 1.245, 0.22);
+  damageCrackGroup.add(roofCrackMesh);
+
+  const leftSideCrackMesh = new THREE.Mesh(assets.sideCrackGeo, damageCrackMaterial);
+  leftSideCrackMesh.position.set(-1.02, 0.62, 0.15);
+  leftSideCrackMesh.rotation.y = -Math.PI / 2;
+  damageCrackGroup.add(leftSideCrackMesh);
+
+  const rightSideCrackMesh = new THREE.Mesh(assets.sideCrackGeo, damageCrackMaterial);
+  rightSideCrackMesh.position.set(1.02, 0.62, 0.15);
+  rightSideCrackMesh.rotation.y = Math.PI / 2;
+  damageCrackGroup.add(rightSideCrackMesh);
+
+  const rearDeckCrackMesh = new THREE.Mesh(assets.rearCrackGeo, damageCrackMaterial);
+  rearDeckCrackMesh.position.set(0, 0.96, 1.72);
+  rearDeckCrackMesh.rotation.x = -0.08;
+  damageCrackGroup.add(rearDeckCrackMesh);
+
+  bodyTiltGroup.add(damageCrackGroup);
+
   const rig: CompositeCarRig = {
     root,
     bodyTiltGroup,
     paintMaterials,
     accentMaterials,
     rimMaterials,
+    bodyTrimMaterial: bodyTrimMat,
+    basePaintColor,
+    baseAccentColor,
+    baseTrimColor,
+    damageCrackGroup,
+    damageCrackMaterial,
+    currentDamageStage: 0,
     brakeLightMaterial,
     exhaustGlowMaterial,
     frontWheelPivots,
@@ -1483,11 +1675,101 @@ export function buildCompositeHypercar(
   return rig;
 }
 
+const _hitFlashRedColor = new THREE.Color('#FF2424');
+const _tempBodyColor = new THREE.Color();
+
+/**
+ * Updates both the 0.25s Minecraft-style Red Hit Flash and the 3-stage Progressive Block Crack
+ * & Paint Darkening (at <=75%, <=50%, and <=25% HP) without mutating shared materials or allocating memory.
+ */
+export function updateCarDamageAndHitFlash(
+  rig: CompositeCarRig,
+  hitFlashTimer: number,
+  hpRatio: number
+): void {
+  const assets = getSharedMuscleCoupeAssets();
+  const clampedHp = THREE.MathUtils.clamp(hpRatio, 0, 1);
+
+  // Determine progressive damage stage: 0 (>75%), 1 (<=75%), 2 (<=50%), 3 (<=25%)
+  const stage =
+    clampedHp <= 0.25 ? 3 : clampedHp <= 0.5 ? 2 : clampedHp <= 0.75 ? 1 : 0;
+
+  if (stage !== rig.currentDamageStage) {
+    rig.currentDamageStage = stage;
+    if (stage === 0) {
+      rig.damageCrackGroup.visible = false;
+      rig.damageCrackMaterial.opacity = 0;
+    } else {
+      rig.damageCrackGroup.visible = true;
+      rig.damageCrackMaterial.map = assets.damageCrackTextures[stage - 1];
+      rig.damageCrackMaterial.opacity =
+        stage === 1 ? 0.62 : stage === 2 ? 0.78 : 0.94;
+      rig.damageCrackMaterial.needsUpdate = true;
+    }
+  }
+
+  // Darken paint progressively at each damage stage (1.0 -> 0.89 -> 0.77 -> 0.63)
+  const stageDarken =
+    stage === 0 ? 1.0 : stage === 1 ? 0.89 : stage === 2 ? 0.77 : 0.63;
+
+  // 0.25s red hit flash fade factor (1.0 on impact -> fades smoothly back to 0.0 over 0.25s)
+  const flashAlpha = THREE.MathUtils.clamp(hitFlashTimer / 0.25, 0, 1);
+
+  // Restore / interpolate paint materials
+  _tempBodyColor.copy(rig.basePaintColor).multiplyScalar(stageDarken);
+  if (flashAlpha > 0) {
+    _tempBodyColor.lerp(_hitFlashRedColor, flashAlpha * 0.78);
+  }
+  for (let i = 0; i < rig.paintMaterials.length; i++) {
+    const mat = rig.paintMaterials[i];
+    mat.color.copy(_tempBodyColor);
+    if (flashAlpha > 0) {
+      mat.emissive.setHex(0xdc2626);
+      mat.emissiveIntensity = flashAlpha * 0.52;
+    } else {
+      mat.emissive.setHex(0x000000);
+      mat.emissiveIntensity = 0.0;
+    }
+  }
+
+  // Restore / interpolate accent materials
+  _tempBodyColor.copy(rig.baseAccentColor).multiplyScalar(stageDarken);
+  if (flashAlpha > 0) {
+    _tempBodyColor.lerp(_hitFlashRedColor, flashAlpha * 0.78);
+  }
+  for (let i = 0; i < rig.accentMaterials.length; i++) {
+    const mat = rig.accentMaterials[i];
+    mat.color.copy(_tempBodyColor);
+    if (flashAlpha > 0) {
+      mat.emissive.setHex(0xdc2626);
+      mat.emissiveIntensity = flashAlpha * 0.52;
+    } else {
+      mat.emissive.setHex(0x000000);
+      mat.emissiveIntensity = 0.0;
+    }
+  }
+
+  // Restore / interpolate per-car body trim material
+  _tempBodyColor.copy(rig.baseTrimColor);
+  if (flashAlpha > 0) {
+    _tempBodyColor.lerp(_hitFlashRedColor, flashAlpha * 0.68);
+    rig.bodyTrimMaterial.emissive.setHex(0xb91c1c);
+    rig.bodyTrimMaterial.emissiveIntensity = flashAlpha * 0.45;
+  } else {
+    rig.bodyTrimMaterial.emissive.setHex(0x000000);
+    rig.bodyTrimMaterial.emissiveIntensity = 0.0;
+  }
+  rig.bodyTrimMaterial.color.copy(_tempBodyColor);
+}
+
 export function applyLiveryToCarRig(rig: CompositeCarRig, livery: CarLivery): void {
   const resolvedHex =
     livery.primaryHex && livery.primaryHex.toUpperCase() === '#F8FAFC'
       ? DEFAULT_CAR_PAINT_HEX
       : livery.primaryHex || DEFAULT_CAR_PAINT_HEX;
+
+  rig.basePaintColor.set(resolvedHex);
+  rig.baseAccentColor.set(livery.accentHex);
 
   rig.paintMaterials.forEach((mat) => {
     mat.color.set(resolvedHex);

@@ -74,6 +74,10 @@ const INITIAL_TELEMETRY: RaceTelemetry = {
   activeRivalsCount: 5,
   playerHp: 100,
   playerMaxHp: 100,
+  playerPrevHeartHp: 100,
+  playerHeartFlashing: false,
+  playerHitVignetteAlpha: 0,
+  playerDamageStage: 0,
   isPlayerDestroyed: false,
   playerRespawnTimer: 0,
   isPlayerInvulnerable: false,
@@ -88,6 +92,92 @@ const INITIAL_TELEMETRY: RaceTelemetry = {
   rivalOverlays: [],
   standings: [],
 };
+
+// Minecraft-style 10-Heart Pixel Art Row (10 HP = 1 full heart, 5 HP = half-heart, grey when damaged, white flash when lost)
+const PIXEL_HEART_SVG_ROWS = [
+  '01100110',
+  '12211221',
+  '13222221',
+  '12222221',
+  '01222210',
+  '00122100',
+  '00011000',
+];
+
+function PixelHeartIcon({
+  state,
+  size = 12,
+}: {
+  state: 'full' | 'half' | 'empty' | 'flash';
+  size?: number;
+}) {
+  return (
+    <svg
+      width={size}
+      height={Math.round((size * 7) / 8)}
+      viewBox="0 0 8 7"
+      shapeRendering="crispEdges"
+      className="shrink-0"
+      aria-hidden="true"
+    >
+      {PIXEL_HEART_SVG_ROWS.map((row, py) =>
+        row.split('').map((ch, px) => {
+          if (ch === '0') return null;
+          let fill = '#090b10';
+          if (ch === '1') {
+            fill = state === 'flash' ? '#ffffff' : '#090b10';
+          } else if (state === 'flash') {
+            fill = '#ffffff';
+          } else if (state === 'full') {
+            fill = ch === '3' ? '#fecdd3' : '#ef4444';
+          } else if (state === 'half') {
+            if (px < 4) {
+              fill = ch === '3' ? '#fecdd3' : '#ef4444';
+            } else {
+              fill = '#334155';
+            }
+          } else {
+            fill = ch === '3' ? '#475569' : '#334155';
+          }
+          return (
+            <rect key={`${px}-${py}`} x={px} y={py} width={1} height={1} fill={fill} />
+          );
+        })
+      )}
+    </svg>
+  );
+}
+
+function PixelHeartRow({
+  hp,
+  prevHp,
+  isFlashing,
+  heartSize = 12,
+}: {
+  hp: number;
+  prevHp: number;
+  isFlashing: boolean;
+  heartSize?: number;
+}) {
+  return (
+    <div className="flex items-center gap-0.5" role="img" aria-label={`${hp} HP in 10 hearts`}>
+      {Array.from({ length: 10 }).map((_, i) => {
+        const heartMin = i * 10;
+        const rem = Math.max(0, Math.min(10, hp - heartMin));
+        const prevRem = Math.max(0, Math.min(10, prevHp - heartMin));
+        const wasJustLost = isFlashing && prevRem > rem;
+        const state: 'full' | 'half' | 'empty' | 'flash' = wasJustLost
+          ? 'flash'
+          : rem >= 8
+            ? 'full'
+            : rem >= 3
+              ? 'half'
+              : 'empty';
+        return <PixelHeartIcon key={i} state={state} size={heartSize} />;
+      })}
+    </div>
+  );
+}
 
 export default function App() {
   const [trackTheme, setTrackTheme] = useState<TrackTheme>('canyon');
@@ -308,7 +398,20 @@ export default function App() {
           onStatusChange={setRaceStatus}
         />
 
-        {/* 2D SCREEN-PROJECTED TARGETING CROSSHAIR & RIVAL TARGET BOXES / HEALTH BARS */}
+        {/* SHORT SCREEN-EDGE RED VIGNETTE FLASH WHEN PLAYER TAKES DAMAGE */}
+        {combatMode && (telemetry.playerHitVignetteAlpha ?? 0) > 0.01 && (
+          <div
+            aria-hidden="true"
+            style={{
+              opacity: (telemetry.playerHitVignetteAlpha ?? 0) * 0.85,
+              boxShadow:
+                'inset 0 0 85px 28px rgba(239, 68, 68, 0.78), inset 0 0 24px 6px rgba(220, 38, 38, 0.92)',
+            }}
+            className="pointer-events-none absolute inset-0 z-20 border-4 border-rose-500/80 transition-opacity duration-75"
+          />
+        )}
+
+        {/* 2D SCREEN-PROJECTED TARGETING CROSSHAIR & RIVAL TARGET BOXES / PIXEL HEARTS HEALTH BARS */}
         {combatMode && raceStatus === 'racing' && (
           <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
             {/* Small Crosshair Ahead of the Car */}
@@ -338,7 +441,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Compact Rival Health Bars & Red Target Lock Box (100 HP max, scaled so car is unobstructed) */}
+            {/* Compact Rival 10-Heart Pixel Health Bars & Red Target Lock Box (100 HP max, 10 HP per heart) */}
             {telemetry.rivalOverlays.map((rv) => {
               if (!rv.visible) return null;
               const hpPct = Math.max(0, Math.min(100, (rv.hp / rv.maxHp) * 100));
@@ -356,9 +459,9 @@ export default function App() {
                   }}
                   className="absolute origin-bottom flex flex-col items-center transition-all duration-75"
                 >
-                  {/* Compact Health Bar Above Each AI Car (100 HP) */}
-                  <div className="px-1 py-0.5 rounded bg-[#090D16]/80 border border-white/15 flex flex-col items-center gap-0.5 shadow-sm">
-                    <div className="flex items-center gap-1 text-[8px] font-mono-tabular leading-none">
+                  {/* Compact 10-Heart Pixel Health Bar Above Each AI Car (100 HP) */}
+                  <div className="px-1.5 py-1 rounded bg-[#090D16]/88 border border-white/15 flex flex-col items-center gap-1 shadow-sm">
+                    <div className="flex items-center justify-between w-full gap-1.5 text-[8px] font-mono-tabular leading-none">
                       <span
                         className={
                           rv.isLockedTarget
@@ -368,9 +471,15 @@ export default function App() {
                       >
                         {rv.driverName.split(' ')[0]}
                       </span>
-                      <span className="text-slate-300">{rv.hp}</span>
+                      <span className="text-slate-300">{rv.hp} HP</span>
                     </div>
-                    <div className="w-11 h-1 rounded-full bg-white/15 overflow-hidden">
+                    <PixelHeartRow
+                      hp={rv.hp}
+                      prevHp={rv.prevHeartHp ?? rv.hp}
+                      isFlashing={rv.isHeartFlashing ?? false}
+                      heartSize={7}
+                    />
+                    <div className="w-full h-1 rounded-full bg-white/15 overflow-hidden">
                       <div
                         className={`h-full transition-all duration-75 ${
                           hpPct > 50
@@ -416,8 +525,8 @@ export default function App() {
                 </span>
               </div>
 
-              {/* Player Hull Health Bar (100 HP) */}
-              <div className="space-y-1">
+              {/* Player Hull Health Bar (10 Pixel Hearts + 100 HP Bar) */}
+              <div className="space-y-1.5">
                 <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[10px] font-mono-tabular">
                   <span className="text-slate-300 font-medium">Armor Integrity</span>
                   <span
@@ -437,6 +546,14 @@ export default function App() {
                         ? `SHIELDED · ${telemetry.playerHp} HP`
                         : `${telemetry.playerHp} / ${telemetry.playerMaxHp} HP`}
                   </span>
+                </div>
+                <div className="flex items-center justify-between py-0.5">
+                  <PixelHeartRow
+                    hp={telemetry.playerHp}
+                    prevHp={telemetry.playerPrevHeartHp ?? telemetry.playerHp}
+                    isFlashing={telemetry.playerHeartFlashing ?? false}
+                    heartSize={13}
+                  />
                 </div>
                 <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
                   <div

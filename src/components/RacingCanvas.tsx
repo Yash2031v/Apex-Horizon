@@ -22,6 +22,7 @@ import {
   buildCompositeHypercar,
   CompositeCarRig,
   createStudioEnvironmentTexture,
+  updateCarDamageAndHitFlash,
 } from '../three/carBuilder';
 import {
   createContactShadowTexture,
@@ -227,6 +228,148 @@ function createFireworkParticleMaterial(
     blending: THREE.AdditiveBlending,
     toneMapped: false,
   });
+}
+
+// 5x7 Blocky Pixel-Art Bitmap Glyphs for Floating Damage Numbers ('-', '0'..'9')
+const PIXEL_FONT_5X7: Record<string, number[]> = {
+  '-': [0, 0, 0, 31, 0, 0, 0],
+  '0': [14, 17, 19, 21, 25, 17, 14],
+  '1': [4, 12, 4, 4, 4, 4, 14],
+  '2': [14, 17, 1, 6, 8, 16, 31],
+  '3': [30, 1, 1, 14, 1, 1, 30],
+  '4': [2, 6, 10, 18, 31, 2, 2],
+  '5': [31, 16, 30, 1, 1, 17, 14],
+  '6': [14, 16, 30, 17, 17, 17, 14],
+  '7': [31, 1, 2, 4, 8, 8, 8],
+  '8': [14, 17, 17, 14, 17, 17, 14],
+  '9': [14, 17, 17, 15, 1, 1, 14],
+};
+
+/**
+ * Draws a crisp blocky pixel-style damage number (e.g. "-4" or "-35") in bright red
+ * with a solid black pixel outline onto a pooled 128x64 sprite canvas.
+ */
+function drawPixelDamageNumberCanvas(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  isHeavy: boolean
+): void {
+  ctx.clearRect(0, 0, 128, 64);
+  const px = isHeavy ? 6 : 5;
+  const charGap = 1; // 1 pixel column between glyphs
+  const totalCols = text.length * 5 + Math.max(0, text.length - 1) * charGap;
+  const startX = Math.floor((128 - totalCols * px) * 0.5);
+  const startY = Math.floor((64 - 7 * px) * 0.5);
+
+  // Pass 1: Thick blocky black pixel outline + drop shadow
+  ctx.fillStyle = '#090D16';
+  for (let c = 0; c < text.length; c++) {
+    const rows = PIXEL_FONT_5X7[text[c]] || PIXEL_FONT_5X7['0'];
+    const charX = startX + c * (5 + charGap) * px;
+    for (let r = 0; r < 7; r++) {
+      const rowBits = rows[r];
+      for (let col = 0; col < 5; col++) {
+        if ((rowBits >> (4 - col)) & 1) {
+          const x = charX + col * px;
+          const y = startY + r * px;
+          ctx.fillRect(x - px, y, px, px);
+          ctx.fillRect(x + px, y, px, px);
+          ctx.fillRect(x, y - px, px, px);
+          ctx.fillRect(x, y + px, px, px);
+          ctx.fillRect(x + px, y + px, px, px);
+        }
+      }
+    }
+  }
+
+  // Pass 2: Crisp red pixel fill with bright top-edge pixel highlight
+  for (let c = 0; c < text.length; c++) {
+    const rows = PIXEL_FONT_5X7[text[c]] || PIXEL_FONT_5X7['0'];
+    const charX = startX + c * (5 + charGap) * px;
+    for (let r = 0; r < 7; r++) {
+      const rowBits = rows[r];
+      for (let col = 0; col < 5; col++) {
+        if ((rowBits >> (4 - col)) & 1) {
+          const x = charX + col * px;
+          const y = startY + r * px;
+          ctx.fillStyle =
+            r <= 1 ? (isHeavy ? '#FEF08A' : '#FCA5A5') : '#FF2424';
+          ctx.fillRect(x, y, px, px);
+        }
+      }
+    }
+  }
+}
+
+// 8x7 Pixel-Art Heart Mask (1 = heart pixel, 0 = outside)
+const PIXEL_HEART_MASK: number[][] = [
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [1, 1, 1, 1, 1, 1, 1, 1],
+  [1, 1, 1, 1, 1, 1, 1, 1],
+  [1, 1, 1, 1, 1, 1, 1, 1],
+  [0, 1, 1, 1, 1, 1, 1, 0],
+  [0, 0, 1, 1, 1, 1, 0, 0],
+  [0, 0, 0, 1, 1, 0, 0, 0],
+];
+
+/**
+ * Draws a row of 10 pixel-style hearts (10 HP per heart, 5 HP half-heart, grey when empty,
+ * and flashing white on recently lost hearts) onto a rival's 3D overhead canvas texture.
+ */
+function drawPixelHeartsToCanvas(
+  ctx: CanvasRenderingContext2D,
+  hp: number,
+  prevHeartHp: number,
+  isFlashing: boolean
+): void {
+  ctx.clearRect(0, 0, 256, 32);
+  const px = 2; // each heart is 8*2 = 16px wide, 7*2 = 14px tall
+  const heartStep = 24; // 10 hearts * 24 = 240px centered in 256px
+  const baseStartX = 10;
+  const baseStartY = 9;
+
+  for (let h = 0; h < 10; h++) {
+    const hx = baseStartX + h * heartStep;
+    const heartMinHp = h * 10;
+    const heartHp = THREE.MathUtils.clamp(hp - heartMinHp, 0, 10);
+    const wasLost =
+      isFlashing && prevHeartHp > hp && prevHeartHp > heartMinHp && heartHp < 10;
+
+    // 1. Draw blocky pixel border around heart (white border when flashing lost heart, dark otherwise)
+    ctx.fillStyle = wasLost ? '#FFFFFF' : '#090D16';
+    for (let r = 0; r < 7; r++) {
+      for (let c = 0; c < 8; c++) {
+        if (PIXEL_HEART_MASK[r][c]) {
+          const x = hx + c * px;
+          const y = baseStartY + r * px;
+          ctx.fillRect(x - px, y, px, px);
+          ctx.fillRect(x + px, y, px, px);
+          ctx.fillRect(x, y - px, px, px);
+          ctx.fillRect(x, y + px, px, px);
+        }
+      }
+    }
+
+    // 2. Draw interior heart pixels (Full Red >= 8 HP, Half Red 3..7 HP, Grey Empty, or White Flash on lost portion)
+    for (let r = 0; r < 7; r++) {
+      for (let c = 0; c < 8; c++) {
+        if (!PIXEL_HEART_MASK[r][c]) continue;
+        const x = hx + c * px;
+        const y = baseStartY + r * px;
+        const isFilledHalf =
+          heartHp >= 8 || (heartHp >= 3 && c < 4);
+
+        if (isFilledHalf) {
+          ctx.fillStyle = r === 1 && (c === 1 || c === 2) ? '#FCA5A5' : '#EF4444';
+        } else if (wasLost) {
+          ctx.fillStyle = '#FFFFFF';
+        } else {
+          ctx.fillStyle = r <= 2 ? '#475569' : '#334155';
+        }
+        ctx.fillRect(x, y, px, px);
+      }
+    }
+  }
 }
 
 // Pre-allocated module-scope math objects (Zero GC in render loop)
@@ -757,7 +900,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
     const darkenNonBloomed = (obj: THREE.Object3D) => {
       if (
-        (obj instanceof THREE.Points || obj instanceof THREE.LineSegments) &&
+        (obj instanceof THREE.Points ||
+          obj instanceof THREE.LineSegments ||
+          obj instanceof THREE.Sprite) &&
         !bloomLayer.test(obj.layers)
       ) {
         if (obj.visible) {
@@ -851,7 +996,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     });
     scene.add(playerRig.root);
 
-    // Build 5 AI Rival Composite Hypercars + 3D World-Space Health Bars
+    // Build 5 AI Rival Composite Hypercars + 3D World-Space 10-Heart Pixel Health Bars
     const rivalRigs: CompositeCarRig[] = [];
     const rivalsState: RivalCarState[] = [];
     const rivalHeadings: number[] = [];
@@ -859,6 +1004,12 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       group: THREE.Group;
       fillMesh: THREE.Mesh;
       fillMat: THREE.MeshBasicMaterial;
+      heartsCanvas: HTMLCanvasElement;
+      heartsCtx: CanvasRenderingContext2D;
+      heartsTex: THREE.CanvasTexture;
+      heartsMat: THREE.MeshBasicMaterial;
+      lastRenderedHp: number;
+      lastRenderedFlash: boolean;
       lockBox: THREE.LineSegments;
     }[] = [];
 
@@ -872,6 +1023,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       side: THREE.DoubleSide,
     });
     const hpFillGeo = new THREE.PlaneGeometry(1.04, 0.07);
+    const heartsPlaneGeo = new THREE.PlaneGeometry(1.55, 0.2);
     const lockBoxGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(2.15, 1.15, 4.3));
     const lockBoxMat = new THREE.LineBasicMaterial({
       color: 0xef4444,
@@ -887,10 +1039,11 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         c.visible = initialConfig.headlightsActive;
       });
 
-      // Compact 3D Floating Health Bar above each AI car (100 HP max)
+      // Compact 3D Floating 10-Heart Pixel Health Bar above each AI car (100 HP max, 10 HP per heart)
       const hbGroup = new THREE.Group();
-      hbGroup.position.set(0, 2.15, 0);
+      hbGroup.position.set(0, 2.22, 0);
       const bgMesh = new THREE.Mesh(hpBgGeo, hpBgMat);
+      bgMesh.position.set(0, -0.14, 0);
       bgMesh.renderOrder = 10;
       hbGroup.add(bgMesh);
 
@@ -901,9 +1054,35 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         side: THREE.DoubleSide,
       });
       const fillMesh = new THREE.Mesh(hpFillGeo, fillMat);
-      fillMesh.position.set(0, 0, 0.01);
+      fillMesh.position.set(0, -0.14, 0.01);
       fillMesh.renderOrder = 11;
       hbGroup.add(fillMesh);
+
+      // 3D Pixel-Art 10-Hearts Row Plane above the rival car
+      const heartsCanvas = document.createElement('canvas');
+      heartsCanvas.width = 256;
+      heartsCanvas.height = 32;
+      const heartsCtx = heartsCanvas.getContext('2d')!;
+      drawPixelHeartsToCanvas(heartsCtx, 100, 100, false);
+
+      const heartsTex = new THREE.CanvasTexture(heartsCanvas);
+      heartsTex.colorSpace = THREE.SRGBColorSpace;
+      heartsTex.magFilter = THREE.NearestFilter;
+      heartsTex.minFilter = THREE.NearestFilter;
+      heartsTex.needsUpdate = true;
+
+      const heartsMat = new THREE.MeshBasicMaterial({
+        map: heartsTex,
+        transparent: true,
+        depthTest: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      const heartsMesh = new THREE.Mesh(heartsPlaneGeo, heartsMat);
+      heartsMesh.position.set(0, 0.04, 0.015);
+      heartsMesh.renderOrder = 12;
+      hbGroup.add(heartsMesh);
+
       rig.root.add(hbGroup);
 
       const lockBox = new THREE.LineSegments(lockBoxGeo, lockBoxMat);
@@ -915,6 +1094,12 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         group: hbGroup,
         fillMesh,
         fillMat,
+        heartsCanvas,
+        heartsCtx,
+        heartsTex,
+        heartsMat,
+        lastRenderedHp: 100,
+        lastRenderedFlash: false,
         lockBox,
       });
 
@@ -941,6 +1126,13 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         gapSeconds: 0,
         hp: 100,
         maxHp: 100,
+        prevHeartHp: 100,
+        heartFlashTimer: 0,
+        damageStage: 0,
+        hitWobbleTimer: 0,
+        hitWobbleIntensity: 0,
+        knockbackX: 0,
+        knockbackZ: 0,
         isEliminated: false,
         respawnTimer: 0,
         hitSlowTimer: 0,
@@ -1610,17 +1802,203 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       }
 
       spawnCollisionSparks(wx, wy + 0.4, wz, 20, 1.0);
-      for (let s = 0; s < 8; s++) {
-        spawnSmokePuff(
-          wx + (Math.random() - 0.5) * 1.5,
-          wy + 0.6,
-          wz + (Math.random() - 0.5) * 1.5,
-          (Math.random() - 0.5) * 4,
-          2.5 + Math.random() * 3,
-          (Math.random() - 0.5) * 4,
-          0.85
-        );
+      // Additional burst of Minecraft-style blocky voxel cubes on 0 HP explosion
+      spawnBlockyDamageParticles(wx, wy + 0.65, wz, 42, 1.85);
+    };
+
+    // 10B. Pooled Minecraft-Style Blocky Damage Cube Particles (InstancedMesh, Red/Orange/Grey Metal Chips)
+    const BLOCKY_PARTICLE_POOL_SIZE = 180;
+    const blockyCubeGeo = new THREE.BoxGeometry(0.19, 0.19, 0.19);
+    const blockyCubeMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.42,
+      metalness: 0.22,
+    });
+    const blockyParticleInst = new THREE.InstancedMesh(
+      blockyCubeGeo,
+      blockyCubeMat,
+      BLOCKY_PARTICLE_POOL_SIZE
+    );
+    blockyParticleInst.frustumCulled = false;
+
+    const blockyPaletteHex = [
+      '#EF4444', // bright red
+      '#DC2626', // crimson red
+      '#F97316', // vivid orange
+      '#FB923C', // warm amber-orange
+      '#94A3B8', // light grey metal chip
+      '#475569', // dark grey metal chip
+    ];
+    const _blockyTempColor = new THREE.Color();
+    const _blockyMatrix = new THREE.Matrix4();
+    const _blockyPos = new THREE.Vector3(0, -999, 0);
+    const _blockyEuler = new THREE.Euler();
+    const _blockyQuat = new THREE.Quaternion();
+    const _blockyScale = new THREE.Vector3(0, 0, 0);
+
+    const blockyActive = new Uint8Array(BLOCKY_PARTICLE_POOL_SIZE);
+    const blockyLife = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE);
+    const blockyMaxLife = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE);
+    const blockyPosArr = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE * 3);
+    const blockyVelArr = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE * 3);
+    const blockyRotArr = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE * 3);
+    const blockyAngVelArr = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE * 3);
+    const blockyBaseScaleArr = new Float32Array(BLOCKY_PARTICLE_POOL_SIZE);
+
+    for (let i = 0; i < BLOCKY_PARTICLE_POOL_SIZE; i++) {
+      blockyPosArr[i * 3 + 1] = -999;
+      _blockyMatrix.compose(_blockyPos, _blockyQuat, _blockyScale);
+      blockyParticleInst.setMatrixAt(i, _blockyMatrix);
+      _blockyTempColor.set(blockyPaletteHex[i % blockyPaletteHex.length]);
+      blockyParticleInst.setColorAt(i, _blockyTempColor);
+    }
+    blockyParticleInst.instanceMatrix.needsUpdate = true;
+    if (blockyParticleInst.instanceColor) {
+      blockyParticleInst.instanceColor.needsUpdate = true;
+    }
+    scene.add(blockyParticleInst);
+
+    let blockyCursor = 0;
+    const spawnBlockyDamageParticles = (
+      wx: number,
+      wy: number,
+      wz: number,
+      count: number,
+      velocityScale: number = 1.0
+    ) => {
+      for (let k = 0; k < count; k++) {
+        const idx = blockyCursor % BLOCKY_PARTICLE_POOL_SIZE;
+        blockyCursor++;
+        blockyActive[idx] = 1;
+        const dur = 0.48 + Math.random() * 0.34;
+        blockyLife[idx] = dur;
+        blockyMaxLife[idx] = dur;
+
+        blockyPosArr[idx * 3] = wx + (Math.random() - 0.5) * 0.9;
+        blockyPosArr[idx * 3 + 1] = wy + (Math.random() - 0.3) * 0.5;
+        blockyPosArr[idx * 3 + 2] = wz + (Math.random() - 0.5) * 0.9;
+
+        const outAngle = Math.random() * Math.PI * 2;
+        const outSpeed = (3.8 + Math.random() * 8.5) * velocityScale;
+        blockyVelArr[idx * 3] = Math.cos(outAngle) * outSpeed;
+        blockyVelArr[idx * 3 + 1] = (4.2 + Math.random() * 7.2) * velocityScale;
+        blockyVelArr[idx * 3 + 2] = Math.sin(outAngle) * outSpeed;
+
+        blockyRotArr[idx * 3] = Math.random() * Math.PI;
+        blockyRotArr[idx * 3 + 1] = Math.random() * Math.PI;
+        blockyRotArr[idx * 3 + 2] = Math.random() * Math.PI;
+
+        blockyAngVelArr[idx * 3] = (Math.random() - 0.5) * 14;
+        blockyAngVelArr[idx * 3 + 1] = (Math.random() - 0.5) * 14;
+        blockyAngVelArr[idx * 3 + 2] = (Math.random() - 0.5) * 14;
+
+        blockyBaseScaleArr[idx] =
+          (0.75 + Math.random() * 0.65) * (velocityScale > 1.2 ? 1.25 : 1.0);
       }
+    };
+
+    // 10C. Pooled Camera-Facing Floating Damage Numbers ("-4", "-35" in Red Blocky Pixel Font, 0.8s Float & Fade)
+    const FLOATING_DMG_POOL_SIZE = 24;
+    interface PooledFloatingDamage {
+      active: boolean;
+      timer: number;
+      duration: number;
+      x: number;
+      y: number;
+      z: number;
+      vx: number;
+      vy: number;
+      vz: number;
+      baseScale: number;
+      lastAmount: number;
+      lastHeavy: boolean;
+      canvas: HTMLCanvasElement;
+      ctx: CanvasRenderingContext2D;
+      texture: THREE.CanvasTexture;
+      material: THREE.SpriteMaterial;
+      sprite: THREE.Sprite;
+    }
+    const floatingDamagePool: PooledFloatingDamage[] = [];
+    for (let i = 0; i < FLOATING_DMG_POOL_SIZE; i++) {
+      const fCanvas = document.createElement('canvas');
+      fCanvas.width = 128;
+      fCanvas.height = 64;
+      const fCtx = fCanvas.getContext('2d')!;
+      drawPixelDamageNumberCanvas(fCtx, '-4', false);
+
+      const fTex = new THREE.CanvasTexture(fCanvas);
+      fTex.colorSpace = THREE.SRGBColorSpace;
+      fTex.magFilter = THREE.NearestFilter;
+      fTex.minFilter = THREE.NearestFilter;
+      fTex.needsUpdate = true;
+
+      const fMat = new THREE.SpriteMaterial({
+        map: fTex,
+        transparent: true,
+        opacity: 0,
+        depthTest: false,
+        depthWrite: false,
+      });
+      const fSprite = new THREE.Sprite(fMat);
+      fSprite.visible = false;
+      fSprite.renderOrder = 25;
+      scene.add(fSprite);
+
+      floatingDamagePool.push({
+        active: false,
+        timer: 0,
+        duration: 0.8,
+        x: 0,
+        y: -999,
+        z: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        baseScale: 1.5,
+        lastAmount: 4,
+        lastHeavy: false,
+        canvas: fCanvas,
+        ctx: fCtx,
+        texture: fTex,
+        material: fMat,
+        sprite: fSprite,
+      });
+    }
+    let floatingDamageCursor = 0;
+
+    const spawnFloatingDamageNumber = (
+      wx: number,
+      wy: number,
+      wz: number,
+      amount: number,
+      isHeavyHit: boolean
+    ) => {
+      const fd =
+        floatingDamagePool[floatingDamageCursor % FLOATING_DMG_POOL_SIZE];
+      floatingDamageCursor++;
+      fd.active = true;
+      fd.timer = 0;
+      fd.duration = 0.8; // floats up and fades out in 0.8 seconds
+      fd.x = wx + (Math.random() - 0.5) * 0.65;
+      fd.y = wy;
+      fd.z = wz + (Math.random() - 0.5) * 0.65;
+      fd.vx = (Math.random() - 0.5) * 1.4;
+      fd.vy = isHeavyHit ? 3.2 : 2.4;
+      fd.vz = (Math.random() - 0.5) * 1.4;
+      fd.baseScale = isHeavyHit ? 2.45 : 1.55; // larger for heavy/missile hits
+
+      const rounded = Math.max(1, Math.round(amount));
+      if (fd.lastAmount !== rounded || fd.lastHeavy !== isHeavyHit) {
+        fd.lastAmount = rounded;
+        fd.lastHeavy = isHeavyHit;
+        drawPixelDamageNumberCanvas(fd.ctx, `-${rounded}`, isHeavyHit);
+        fd.texture.needsUpdate = true;
+      }
+
+      fd.material.opacity = 1.0;
+      fd.sprite.position.set(fd.x, fd.y, fd.z);
+      fd.sprite.scale.set(fd.baseScale, fd.baseScale * 0.5, 1);
+      fd.sprite.visible = true;
     };
 
     // 11. Pooled Multi-Color Finish Celebration Fireworks Particle System (World-Space, Zero-GC Pool)
@@ -2047,6 +2425,13 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       // Combat state
       hp: 100,
       maxHp: 100,
+      prevHeartHp: 100,
+      heartFlashTimer: 0,
+      damageStage: 0,
+      hitWobbleTimer: 0,
+      hitWobbleIntensity: 0,
+      knockbackX: 0,
+      knockbackZ: 0,
       isDestroyed: false,
       respawnTimer: 0,
       invulnerableTimer: 0,
@@ -2124,6 +2509,13 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       playerState.raceTimeElapsed = 0;
 
       playerState.hp = 100;
+      playerState.prevHeartHp = 100;
+      playerState.heartFlashTimer = 0;
+      playerState.damageStage = 0;
+      playerState.hitWobbleTimer = 0;
+      playerState.hitWobbleIntensity = 0;
+      playerState.knockbackX = 0;
+      playerState.knockbackZ = 0;
       playerState.isDestroyed = false;
       playerState.respawnTimer = 0;
       playerState.invulnerableTimer = 0;
@@ -2138,10 +2530,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       playerState.killFeed = [];
       playerState.lockedRivalIdx = -1;
       playerRig.root.visible = true;
-      playerRig.paintMaterials.forEach((mat) => {
-        mat.emissive.setHex(0x000000);
-        mat.emissiveIntensity = 0;
-      });
+      playerRig.bodyTiltGroup.position.set(0, 0, 0);
+      updateCarDamageAndHitFlash(playerRig, 0, 1.0);
 
       bulletPool.forEach((b) => {
         b.active = false;
@@ -2155,6 +2545,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         mf.active = false;
         mf.mesh.visible = false;
       });
+      floatingDamagePool.forEach((fd) => {
+        fd.active = false;
+        fd.sprite.visible = false;
+      });
+      for (let i = 0; i < BLOCKY_PARTICLE_POOL_SIZE; i++) {
+        blockyActive[i] = 0;
+        blockyLife[i] = 0;
+        blockyPosArr[i * 3 + 1] = -999;
+        _blockyPos.set(0, -999, 0);
+        _blockyScale.set(0, 0, 0);
+        _blockyMatrix.compose(_blockyPos, _blockyQuat, _blockyScale);
+        blockyParticleInst.setMatrixAt(i, _blockyMatrix);
+      }
+      blockyParticleInst.instanceMatrix.needsUpdate = true;
+
       pickupPool.forEach((pk) => {
         pk.active = true;
         pk.respawnTimer = 0;
@@ -2189,6 +2594,13 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         rival.gapSeconds = 0;
         rival.hp = 100;
         rival.maxHp = 100;
+        rival.prevHeartHp = 100;
+        rival.heartFlashTimer = 0;
+        rival.damageStage = 0;
+        rival.hitWobbleTimer = 0;
+        rival.hitWobbleIntensity = 0;
+        rival.knockbackX = 0;
+        rival.knockbackZ = 0;
         rival.isEliminated = false;
         rival.respawnTimer = 0;
         rival.hitSlowTimer = 0;
@@ -2198,10 +2610,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         rival.aiReloadTimer = 1.4 + idx * 0.45;
         rivalWasAhead[idx] = true;
         rivalRigs[idx].root.visible = true;
-        rivalRigs[idx].paintMaterials.forEach((mat) => {
-          mat.emissive.setHex(0x000000);
-          mat.emissiveIntensity = 0;
-        });
+        rivalRigs[idx].bodyTiltGroup.position.set(0, 0, 0);
+        updateCarDamageAndHitFlash(rivalRigs[idx], 0, 1.0);
 
         evaluateTrackFrame(rival.trackDistance, _rivalFrame);
         rivalHeadings[idx] = Math.atan2(
@@ -2318,33 +2728,88 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     };
     window.addEventListener('resize', handleResize);
 
-    // Helper to apply damage to a rival car (with hit flash, sparks, 0.5s slowdown, and 0 HP explosion)
+    // Helper to apply Minecraft-style damage to a rival car (0.25s red flash, knockback + 0.3s wobble, floating damage number, blocky cube particles, heart flash & progressive crack stage)
     const damageRival = (
       rivalIdx: number,
       damageAmount: number,
-      byPlayer: boolean
+      byPlayer: boolean,
+      sourceWorldX?: number,
+      sourceWorldZ?: number,
+      isHeavyMissile: boolean = damageAmount >= 20
     ) => {
       const rival = rivalsState[rivalIdx];
       const rig = rivalRigs[rivalIdx];
       if (!rival || rival.isEliminated) return;
 
+      if (rival.heartFlashTimer <= 0) {
+        rival.prevHeartHp = rival.hp;
+      }
+      const prevStage = rival.damageStage;
       rival.hp = Math.max(0, rival.hp - damageAmount);
-      rival.hitFlashTimer = 0.14;
+      rival.hitFlashTimer = 0.25; // 0.25s red hit flash across all body materials
+      rival.heartFlashTimer = 0.28; // flash lost hearts white briefly
       rival.hitSlowTimer = 0.5; // brief 0.5s slowdown on hit
-      rig.paintMaterials.forEach((mat) => {
-        mat.emissive.setHex(0xffffff);
-        mat.emissiveIntensity = 0.35; // capped subtle hit flash so car body never blooms
-      });
 
-      spawnCollisionSparks(
-        rig.root.position.x,
-        rig.root.position.y + 0.5,
-        rig.root.position.z,
-        8,
-        0.55
+      // Small visual knockback away from damage source + 0.3s body wobble (stronger for missiles)
+      rival.hitWobbleTimer = 0.3;
+      rival.hitWobbleIntensity = isHeavyMissile
+        ? THREE.MathUtils.degToRad(8.5)
+        : THREE.MathUtils.degToRad(4.2);
+
+      const rx = rig.root.position.x;
+      const ry = rig.root.position.y;
+      const rz = rig.root.position.z;
+      const fromX = sourceWorldX !== undefined ? sourceWorldX : _carWorldPos.x;
+      const fromZ = sourceWorldZ !== undefined ? sourceWorldZ : _carWorldPos.z;
+      const pushDx = rx - fromX;
+      const pushDz = rz - fromZ;
+      const pushLen = Math.hypot(pushDx, pushDz) || 1;
+      const kbStrength = isHeavyMissile ? 0.52 : 0.22;
+      rival.knockbackX = (pushDx / pushLen) * kbStrength;
+      rival.knockbackZ = (pushDz / pushLen) * kbStrength;
+      rival.lateralOffset = THREE.MathUtils.clamp(
+        rival.lateralOffset +
+          (pushDx * _rivalFrame.right.x + pushDz * _rivalFrame.right.z) /
+            pushLen *
+            (isHeavyMissile ? 0.65 : 0.24),
+        -ROAD_HALF_WIDTH * 0.92,
+        ROAD_HALF_WIDTH * 0.92
       );
 
+      const hpRatio = rival.hp / rival.maxHp;
+      updateCarDamageAndHitFlash(rig, rival.hitFlashTimer, hpRatio);
+
+      // Check progressive damage stage (75%, 50%, 25% HP)
+      const newStage =
+        hpRatio <= 0.25 ? 3 : hpRatio <= 0.5 ? 2 : hpRatio <= 0.75 ? 1 : 0;
+      rival.damageStage = newStage;
+      if (newStage > prevStage && rival.hp > 0) {
+        soundEngine.playDamageStageBreak(newStage);
+        spawnBlockyDamageParticles(rx, ry + 0.75, rz, 14, 1.25);
+      }
+
+      // Floating red pixel damage number above hit rival
+      spawnFloatingDamageNumber(
+        rx,
+        ry + 1.95,
+        rz,
+        damageAmount,
+        isHeavyMissile
+      );
+
+      // Blocky cube damage particles (missiles spawn more)
+      spawnBlockyDamageParticles(
+        rx,
+        ry + 0.65,
+        rz,
+        isHeavyMissile ? 28 : 10,
+        isHeavyMissile ? 1.45 : 1.0
+      );
+
+      spawnCollisionSparks(rx, ry + 0.5, rz, 8, 0.55);
+
       if (byPlayer) {
+        soundEngine.playBlockyHit(isHeavyMissile);
         soundEngine.playHitConfirm();
         playerState.driftScore += 50;
         triggerScoreEvent(`Target Hit +50`);
@@ -2355,11 +2820,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         rival.respawnTimer = 5.0; // Respawn at back of pack after 5s with 50 HP (unless permanent elimination is ON)
         rival.speed = 0;
         rig.root.visible = false;
-        spawnStylizedExplosion(
-          rig.root.position.x,
-          rig.root.position.y,
-          rig.root.position.z
-        );
+        spawnStylizedExplosion(rx, ry, rz);
 
         const permSuffix = propsRef.current.permanentElimination ? ' [OUT]' : '';
         if (byPlayer) {
@@ -2376,8 +2837,14 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       }
     };
 
-    // Helper to apply damage to the player car
-    const damagePlayer = (damageAmount: number, sourceLabel: string) => {
+    // Helper to apply Minecraft-style damage to the player car
+    const damagePlayer = (
+      damageAmount: number,
+      sourceLabel: string,
+      sourceWorldX?: number,
+      sourceWorldZ?: number,
+      isHeavyHit: boolean = damageAmount >= 16
+    ) => {
       if (
         !propsRef.current.combatMode ||
         playerState.isDestroyed ||
@@ -2385,13 +2852,72 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       ) {
         return;
       }
+      if (playerState.heartFlashTimer <= 0) {
+        playerState.prevHeartHp = playerState.hp;
+      }
+      const prevStage = playerState.damageStage;
       playerState.hp = Math.max(0, playerState.hp - damageAmount);
-      playerState.hitFlashTimer = 0.14;
-      soundEngine.playHitConfirm();
-      playerRig.paintMaterials.forEach((mat) => {
-        mat.emissive.setHex(0xef4444);
-        mat.emissiveIntensity = 0.35; // capped subtle hit flash so player paint never blooms
-      });
+      playerState.hitFlashTimer = 0.25; // 0.25s red hit flash + HUD red screen vignette
+      playerState.heartFlashTimer = 0.28; // flash lost heart white in HUD
+
+      // Small visual knockback + 0.3s body wobble (without breaking steering control)
+      playerState.hitWobbleTimer = 0.3;
+      playerState.hitWobbleIntensity = isHeavyHit
+        ? THREE.MathUtils.degToRad(7.2)
+        : THREE.MathUtils.degToRad(3.6);
+
+      if (sourceWorldX !== undefined && sourceWorldZ !== undefined) {
+        const pushDx = _carWorldPos.x - sourceWorldX;
+        const pushDz = _carWorldPos.z - sourceWorldZ;
+        const pushLen = Math.hypot(pushDx, pushDz) || 1;
+        const kbMag = isHeavyHit ? 0.38 : 0.16;
+        playerState.knockbackX = (pushDx / pushLen) * kbMag;
+        playerState.knockbackZ = (pushDz / pushLen) * kbMag;
+      } else {
+        playerState.knockbackX = (Math.random() - 0.5) * 0.22;
+        playerState.knockbackZ = 0.18;
+      }
+
+      const hpRatio = playerState.hp / playerState.maxHp;
+      updateCarDamageAndHitFlash(
+        playerRig,
+        playerState.hitFlashTimer,
+        hpRatio
+      );
+
+      // Check progressive damage stage (75%, 50%, 25% HP)
+      const newStage =
+        hpRatio <= 0.25 ? 3 : hpRatio <= 0.5 ? 2 : hpRatio <= 0.75 ? 1 : 0;
+      playerState.damageStage = newStage;
+      if (newStage > prevStage && playerState.hp > 0) {
+        soundEngine.playDamageStageBreak(newStage);
+        spawnBlockyDamageParticles(
+          _carWorldPos.x,
+          _carWorldPos.y + 0.75,
+          _carWorldPos.z,
+          14,
+          1.2
+        );
+      }
+
+      // Higher-pitched procedural player hurt sound + low thump + noise burst
+      soundEngine.playPlayerHurt(isHeavyHit);
+
+      // Floating red pixel damage number & blocky damage cubes above player car
+      spawnFloatingDamageNumber(
+        _carWorldPos.x,
+        _carWorldPos.y + 1.9,
+        _carWorldPos.z,
+        damageAmount,
+        isHeavyHit
+      );
+      spawnBlockyDamageParticles(
+        _carWorldPos.x,
+        _carWorldPos.y + 0.65,
+        _carWorldPos.z,
+        isHeavyHit ? 20 : 9,
+        isHeavyHit ? 1.3 : 0.95
+      );
 
       if (playerState.hp <= 0) {
         playerState.isDestroyed = true;
@@ -2487,17 +3013,24 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         }
       }
 
-      // Handle Player Respawn (3s) & Blinking Invulnerability
+      //Handle Player Respawn (3s) & Blinking Invulnerability
       if (playerState.isDestroyed && currentStatus === 'racing') {
         playerState.respawnTimer -= dt;
         if (playerState.respawnTimer <= 0) {
           playerState.isDestroyed = false;
           playerState.hp = 100;
+          playerState.prevHeartHp = 100;
+          playerState.heartFlashTimer = 0;
+          playerState.damageStage = 0;
+          playerState.hitWobbleTimer = 0;
+          playerState.knockbackX = 0;
+          playerState.knockbackZ = 0;
           playerState.lateralOffset = 0;
           playerState.lateralVelocity = 0;
           playerState.speed = 32;
           playerState.invulnerableTimer = 3.0; // 3s blinking invulnerability
           playerRig.root.visible = true;
+          updateCarDamageAndHitFlash(playerRig, 0, 1.0);
           triggerScoreEvent('RESPAWNED — INVULNERABLE');
         }
       }
@@ -2517,13 +3050,39 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
       if (playerState.hitFlashTimer > 0) {
         playerState.hitFlashTimer = Math.max(0, playerState.hitFlashTimer - dt);
-        if (playerState.hitFlashTimer <= 0) {
-          playerRig.paintMaterials.forEach((mat) => {
-            mat.emissive.setHex(0x000000);
-            mat.emissiveIntensity = 0;
-          });
+        updateCarDamageAndHitFlash(
+          playerRig,
+          playerState.hitFlashTimer,
+          playerState.hp / playerState.maxHp
+        );
+      }
+      if (playerState.heartFlashTimer > 0) {
+        playerState.heartFlashTimer = Math.max(
+          0,
+          playerState.heartFlashTimer - dt
+        );
+        if (playerState.heartFlashTimer <= 0) {
+          playerState.prevHeartHp = playerState.hp;
         }
       }
+      if (playerState.hitWobbleTimer > 0) {
+        playerState.hitWobbleTimer = Math.max(
+          0,
+          playerState.hitWobbleTimer - dt
+        );
+      }
+      playerState.knockbackX = THREE.MathUtils.damp(
+        playerState.knockbackX,
+        0,
+        14.0,
+        dt
+      );
+      playerState.knockbackZ = THREE.MathUtils.damp(
+        playerState.knockbackZ,
+        0,
+        14.0,
+        dt
+      );
 
       // Handle Race Countdown Lights (5 red pods -> green GO!)
       if (currentStatus === 'countdown') {
@@ -3017,18 +3576,34 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       );
       const targetPitch =
         throttleInput > 0 ? 0.022 : brakeInput > 0 ? -0.035 : 0;
-      playerRig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(
-        playerRig.bodyTiltGroup.rotation.z,
-        targetRoll,
-        10.5,
-        dt
-      );
-      playerRig.bodyTiltGroup.rotation.x = THREE.MathUtils.damp(
-        playerRig.bodyTiltGroup.rotation.x,
-        targetPitch,
-        10.5,
-        dt
-      );
+      const playerWobbleRatio =
+        playerState.hitWobbleTimer > 0 ? playerState.hitWobbleTimer / 0.3 : 0;
+      const playerWobbleRoll =
+        Math.sin(elapsed * 58) *
+        playerState.hitWobbleIntensity *
+        playerWobbleRatio;
+      const playerWobblePitch =
+        Math.cos(elapsed * 46) *
+        playerState.hitWobbleIntensity *
+        0.55 *
+        playerWobbleRatio;
+
+      playerRig.bodyTiltGroup.rotation.z =
+        THREE.MathUtils.damp(
+          playerRig.bodyTiltGroup.rotation.z,
+          targetRoll,
+          10.5,
+          dt
+        ) + playerWobbleRoll;
+      playerRig.bodyTiltGroup.rotation.x =
+        THREE.MathUtils.damp(
+          playerRig.bodyTiltGroup.rotation.x,
+          targetPitch,
+          10.5,
+          dt
+        ) + playerWobblePitch;
+      playerRig.bodyTiltGroup.position.x = playerState.knockbackX;
+      playerRig.bodyTiltGroup.position.z = playerState.knockbackZ;
 
       // Front wheel steering & spin
       const maxFrontWheelSteerRad = THREE.MathUtils.degToRad(28);
@@ -3110,6 +3685,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
             if (pk.type === 'repair') {
               playerState.hp = Math.min(playerState.maxHp, playerState.hp + 30);
+              playerState.prevHeartHp = playerState.hp;
+              const repairedRatio = playerState.hp / playerState.maxHp;
+              playerState.damageStage =
+                repairedRatio <= 0.25
+                  ? 3
+                  : repairedRatio <= 0.5
+                    ? 2
+                    : repairedRatio <= 0.75
+                      ? 1
+                      : 0;
+              updateCarDamageAndHitFlash(
+                playerRig,
+                playerState.hitFlashTimer,
+                repairedRatio
+              );
               triggerScoreEvent('REPAIR PICKUP +30 HP');
             } else {
               playerState.missileAmmo = Math.min(
@@ -3140,13 +3730,23 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
 
         if (rival.hitFlashTimer > 0) {
           rival.hitFlashTimer = Math.max(0, rival.hitFlashTimer - dt);
-          if (rival.hitFlashTimer <= 0) {
-            rig.paintMaterials.forEach((mat) => {
-              mat.emissive.setHex(0x000000);
-              mat.emissiveIntensity = 0;
-            });
+          updateCarDamageAndHitFlash(
+            rig,
+            rival.hitFlashTimer,
+            rival.hp / rival.maxHp
+          );
+        }
+        if (rival.heartFlashTimer > 0) {
+          rival.heartFlashTimer = Math.max(0, rival.heartFlashTimer - dt);
+          if (rival.heartFlashTimer <= 0) {
+            rival.prevHeartHp = rival.hp;
           }
         }
+        if (rival.hitWobbleTimer > 0) {
+          rival.hitWobbleTimer = Math.max(0, rival.hitWobbleTimer - dt);
+        }
+        rival.knockbackX = THREE.MathUtils.damp(rival.knockbackX, 0, 14.0, dt);
+        rival.knockbackZ = THREE.MathUtils.damp(rival.knockbackZ, 0, 14.0, dt);
 
         // Handle Eliminated Rival Respawn after 5s at back of the pack with 50 HP (disabled if Permanent Elimination is ON)
         if (rival.isEliminated) {
@@ -3156,6 +3756,12 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
               rival.isEliminated = false;
               rival.hp = 50; // Respawn with 50 HP
               rival.maxHp = 100;
+              rival.prevHeartHp = 50;
+              rival.heartFlashTimer = 0;
+              rival.damageStage = 2;
+              rival.hitWobbleTimer = 0;
+              rival.knockbackX = 0;
+              rival.knockbackZ = 0;
               rival.trackDistance = Math.max(0, minPackDistance - 26 - idx * 4);
               rival.lateralOffset = (idx % 2 === 0 ? -1 : 1) * 3.4;
               rival.targetLateral = rival.lateralOffset;
@@ -3163,6 +3769,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
               rival.aiReloadTimer = 1.5;
               rival.aiBurstRemaining = aiDifficultyConfig.burstCount;
               rig.root.visible = true;
+              updateCarDamageAndHitFlash(rig, 0, 0.5);
               evaluateTrackFrame(rival.trackDistance, _rivalFrame);
               rivalHeadings[idx] = Math.atan2(
                 -_rivalFrame.tangent.x,
@@ -3285,9 +3892,17 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
                 if (isCombatMode) {
                   damagePlayer(
                     Math.round(8 + impactSeverity * 14),
-                    rival.driverName
+                    rival.driverName,
+                    rig.root.position.x,
+                    rig.root.position.z
                   );
-                  damageRival(idx, Math.round(6 + impactSeverity * 12), false);
+                  damageRival(
+                    idx,
+                    Math.round(6 + impactSeverity * 12),
+                    false,
+                    _carWorldPos.x,
+                    _carWorldPos.z
+                  );
                 }
 
                 const contactX = (_carWorldPos.x + rig.root.position.x) * 0.5;
@@ -3422,12 +4037,28 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           );
         });
         const aiSpeedRoll = THREE.MathUtils.clamp(rival.speed / 65, 0, 1);
-        rig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(
-          rig.bodyTiltGroup.rotation.z,
-          aiSteer * aiSpeedRoll * THREE.MathUtils.degToRad(4.8),
-          9.0,
-          dt
-        );
+        const rivalWobbleRatio =
+          rival.hitWobbleTimer > 0 ? rival.hitWobbleTimer / 0.3 : 0;
+        const rivalWobbleRoll =
+          Math.sin(elapsed * 58 + idx * 1.7) *
+          rival.hitWobbleIntensity *
+          rivalWobbleRatio;
+        const rivalWobblePitch =
+          Math.cos(elapsed * 46 + idx * 1.3) *
+          rival.hitWobbleIntensity *
+          0.55 *
+          rivalWobbleRatio;
+
+        rig.bodyTiltGroup.rotation.z =
+          THREE.MathUtils.damp(
+            rig.bodyTiltGroup.rotation.z,
+            aiSteer * aiSpeedRoll * THREE.MathUtils.degToRad(4.8),
+            9.0,
+            dt
+          ) + rivalWobbleRoll;
+        rig.bodyTiltGroup.rotation.x = rivalWobblePitch;
+        rig.bodyTiltGroup.position.x = rival.knockbackX;
+        rig.bodyTiltGroup.position.z = rival.knockbackZ;
 
         const rSpin = (rival.speed * dt) / 0.35;
         rig.wheelSpinMeshes.forEach((w) => {
@@ -3549,7 +4180,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       }
       playerState.lockedRivalIdx = bestLockIdx;
 
-      // Update 3D Health Bars & Red Target Lock Bracket above each AI car
+      // Update 3D Pixel Hearts Health Bars & Red Target Lock Bracket above each AI car
       rivalsState.forEach((rival, idx) => {
         const hb = rivalHealthBarRigs[idx];
         if (!isCombatMode || rival.isEliminated) {
@@ -3565,6 +4196,23 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         hb.fillMat.color.setHex(
           hpRatio > 0.5 ? 0x10b981 : hpRatio > 0.3 ? 0xf59e0b : 0xef4444
         );
+        const roundedHp = Math.round(rival.hp);
+        const roundedPrevHp = Math.round(rival.prevHeartHp);
+        const isFlashingHeart = rival.heartFlashTimer > 0;
+        if (
+          hb.lastRenderedHp !== roundedHp ||
+          hb.lastRenderedFlash !== isFlashingHeart
+        ) {
+          hb.lastRenderedHp = roundedHp;
+          hb.lastRenderedFlash = isFlashingHeart;
+          drawPixelHeartsToCanvas(
+            hb.heartsCtx,
+            roundedHp,
+            roundedPrevHp,
+            isFlashingHeart
+          );
+          hb.heartsTex.needsUpdate = true;
+        }
         hb.lockBox.visible = idx === bestLockIdx;
       });
 
@@ -3735,7 +4383,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
               if (dx * dx + dz * dz < 3.6 && Math.abs(dy) < 1.3) {
                 b.active = false;
                 b.mesh.visible = false;
-                damageRival(rIdx, 4, true); // 4 HP per machine gun bullet
+                damageRival(rIdx, 4, true, b.x, b.z); // 4 HP per machine gun bullet
                 break;
               }
             }
@@ -3750,7 +4398,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
                 b.ownerIdx >= 0
                   ? rivalsState[b.ownerIdx].driverName
                   : 'RIVAL';
-              damagePlayer(4, shooterName);
+              damagePlayer(4, shooterName, b.x, b.z, false);
               spawnCollisionSparks(b.x, b.y, b.z, 6, 0.4);
             }
           }
@@ -3810,7 +4458,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
               m.active = false;
               m.group.visible = false;
               spawnCollisionSparks(m.x, m.y, m.z, 18, 0.95);
-              damageRival(rIdx, 35, true); // 35 HP per missile
+              damageRival(rIdx, 35, true, m.x, m.z); // 35 HP per missile
               break;
             }
           }
@@ -3905,6 +4553,96 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
             deb.vy -= 22.0 * dt;
             deb.mesh.rotation.x += deb.rx * dt;
             deb.mesh.rotation.y += deb.ry * dt;
+          }
+        }
+
+        // Update Pooled InstancedMesh Blocky Damage Particles (Cubes with Gravity & Scale Fade)
+        let blockyInstDirty = false;
+        for (let i = 0; i < BLOCKY_PARTICLE_POOL_SIZE; i++) {
+          if (blockyActive[i] === 0) continue;
+          blockyInstDirty = true;
+          blockyLife[i] -= dt;
+          if (blockyLife[i] <= 0) {
+            blockyActive[i] = 0;
+            blockyPosArr[i * 3 + 1] = -999;
+            _blockyPos.set(0, -999, 0);
+            _blockyScale.setScalar(0);
+            _blockyQuat.identity();
+            _blockyMatrix.compose(_blockyPos, _blockyQuat, _blockyScale);
+            blockyParticleInst.setMatrixAt(i, _blockyMatrix);
+          } else {
+            const pIdx = i * 3;
+            blockyPosArr[pIdx] += blockyVelArr[pIdx] * dt;
+            blockyPosArr[pIdx + 1] += blockyVelArr[pIdx + 1] * dt;
+            blockyPosArr[pIdx + 2] += blockyVelArr[pIdx + 2] * dt;
+            blockyVelArr[pIdx + 1] -= 21.5 * dt; // Gravity
+            if (blockyPosArr[pIdx + 1] < 0.08) {
+              blockyPosArr[pIdx + 1] = 0.08;
+              blockyVelArr[pIdx + 1] = Math.abs(blockyVelArr[pIdx + 1]) * 0.32;
+              blockyVelArr[pIdx] *= 0.78;
+              blockyVelArr[pIdx + 2] *= 0.78;
+            }
+            blockyRotArr[pIdx] += blockyAngVelArr[pIdx] * dt;
+            blockyRotArr[pIdx + 1] += blockyAngVelArr[pIdx + 1] * dt;
+            blockyRotArr[pIdx + 2] += blockyAngVelArr[pIdx + 2] * dt;
+            const lifeRatio = THREE.MathUtils.clamp(
+              blockyLife[i] / Math.max(0.001, blockyMaxLife[i]),
+              0,
+              1
+            );
+            _blockyPos.set(
+              blockyPosArr[pIdx],
+              blockyPosArr[pIdx + 1],
+              blockyPosArr[pIdx + 2]
+            );
+            _blockyEuler.set(
+              blockyRotArr[pIdx],
+              blockyRotArr[pIdx + 1],
+              blockyRotArr[pIdx + 2]
+            );
+            _blockyQuat.setFromEuler(_blockyEuler);
+            _blockyScale.setScalar(
+              blockyBaseScaleArr[i] * Math.pow(lifeRatio, 0.45)
+            );
+            _blockyMatrix.compose(_blockyPos, _blockyQuat, _blockyScale);
+            blockyParticleInst.setMatrixAt(i, _blockyMatrix);
+          }
+        }
+        if (blockyInstDirty) {
+          blockyParticleInst.instanceMatrix.needsUpdate = true;
+        }
+
+        // Update Pooled Floating Blocky Damage Numbers (Float Up & Fade Out over 0.8s)
+        for (let i = 0; i < FLOATING_DMG_POOL_SIZE; i++) {
+          const fd = floatingDamagePool[i];
+          if (!fd.active) continue;
+          fd.timer += dt;
+          if (fd.timer >= fd.duration) {
+            fd.active = false;
+            fd.sprite.visible = false;
+          } else {
+            fd.x += fd.vx * dt;
+            fd.y += fd.vy * dt;
+            fd.z += fd.vz * dt;
+            fd.vy = Math.max(0.85, fd.vy - 2.6 * dt);
+            fd.sprite.position.set(fd.x, fd.y, fd.z);
+            const lifeRatio = THREE.MathUtils.clamp(
+              1.0 - fd.timer / fd.duration,
+              0,
+              1
+            );
+            // Pop-in scale then hold steady
+            const popFactor =
+              lifeRatio > 0.82
+                ? THREE.MathUtils.lerp(1.22, 1.0, (1.0 - lifeRatio) / 0.18)
+                : 1.0;
+            fd.sprite.scale.set(
+              fd.baseScale * popFactor,
+              fd.baseScale * 0.5 * popFactor,
+              1
+            );
+            fd.material.opacity =
+              lifeRatio < 0.45 ? lifeRatio / 0.45 : 1.0;
           }
         }
       }
@@ -4377,6 +5115,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
               driverName: rv.driverName,
               hp: rv.hp,
               maxHp: rv.maxHp,
+              prevHeartHp: rv.prevHeartHp,
+              isHeartFlashing: false,
               screenX: 50,
               screenY: 50,
               visible: false,
@@ -4398,6 +5138,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
             driverName: rv.driverName,
             hp: Math.round(rv.hp),
             maxHp: rv.maxHp,
+            prevHeartHp: Math.round(rv.prevHeartHp),
+            isHeartFlashing: rv.heartFlashTimer > 0,
             screenX: (_projVec.x * 0.5 + 0.5) * 100,
             screenY: (-_projVec.y * 0.5 + 0.5) * 100,
             visible: inFrustum,
@@ -4471,6 +5213,16 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
           activeRivalsCount,
           playerHp: Math.round(playerState.hp),
           playerMaxHp: playerState.maxHp,
+          playerPrevHeartHp: Math.round(playerState.prevHeartHp),
+          playerHeartFlashing: playerState.heartFlashTimer > 0,
+          playerHitVignetteAlpha: Number(
+            THREE.MathUtils.clamp(
+              playerState.hitFlashTimer / 0.25,
+              0,
+              1
+            ).toFixed(2)
+          ),
+          playerDamageStage: playerState.damageStage,
           isPlayerDestroyed: playerState.isDestroyed,
           playerRespawnTimer: Number(playerState.respawnTimer.toFixed(1)),
           isPlayerInvulnerable: playerState.invulnerableTimer > 0,
@@ -4561,9 +5313,20 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       shockwaveGeo.dispose();
       debrisGeo.dispose();
       debrisMat.dispose();
+      blockyCubeGeo.dispose();
+      blockyCubeMat.dispose();
+      floatingDamagePool.forEach((fd) => {
+        fd.texture.dispose();
+        fd.material.dispose();
+      });
       hpBgGeo.dispose();
       hpBgMat.dispose();
       hpFillGeo.dispose();
+      heartsPlaneGeo.dispose();
+      rivalHealthBarRigs.forEach((hb) => {
+        hb.heartsTex.dispose();
+        hb.heartsMat.dispose();
+      });
       lockBoxGeo.dispose();
       lockBoxMat.dispose();
       darkOcclusionMaterial.dispose();

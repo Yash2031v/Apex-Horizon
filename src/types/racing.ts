@@ -55,6 +55,13 @@ export interface RivalCarState {
   gapSeconds: number;
   hp: number;
   maxHp: number;
+  prevHeartHp: number;
+  heartFlashTimer: number;
+  damageStage: number; // 0 (100-76%), 1 (<=75%), 2 (<=50%), 3 (<=25%)
+  hitWobbleTimer: number;
+  hitWobbleIntensity: number;
+  knockbackX: number;
+  knockbackZ: number;
   isEliminated: boolean;
   respawnTimer: number;
   hitSlowTimer: number;
@@ -76,6 +83,8 @@ export interface RivalScreenOverlay {
   driverName: string;
   hp: number;
   maxHp: number;
+  prevHeartHp?: number;
+  isHeartFlashing?: boolean;
   screenX: number; // 0..100vw percentage
   screenY: number; // 0..100vh percentage
   visible: boolean;
@@ -115,6 +124,10 @@ export interface RaceTelemetry {
   activeRivalsCount: number;
   playerHp: number;
   playerMaxHp: number;
+  playerPrevHeartHp?: number;
+  playerHeartFlashing?: boolean;
+  playerHitVignetteAlpha?: number;
+  playerDamageStage?: number;
   isPlayerDestroyed: boolean;
   playerRespawnTimer: number;
   isPlayerInvulnerable: boolean;
