@@ -32,6 +32,7 @@ import {
   buildRacingTrack,
   evaluateTrackFrame,
   ROAD_HALF_WIDTH,
+  TimeOfDayEnvironmentState,
   TRACK_LENGTH,
   TrackFrame,
 } from '../three/trackBuilder';
@@ -173,6 +174,61 @@ function createSoftAdditiveParticleMaterial(
   });
 }
 
+/**
+ * Builds a per-vertex colored, twinkling additive sprite ShaderMaterial for celebration fireworks.
+ */
+function createFireworkParticleMaterial(
+  spriteTex: THREE.Texture
+): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: spriteTex },
+      uTime: { value: 0 },
+    },
+    vertexShader: `
+      attribute vec3 aColor;
+      attribute float aAlpha;
+      attribute float aSize;
+      varying vec3 vColor;
+      varying float vAlpha;
+
+      void main() {
+        vColor = aColor;
+        vAlpha = aAlpha;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        gl_PointSize = (aAlpha <= 0.005) ? 0.0 : (aSize * (340.0 / max(1.0, -mvPosition.z)));
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D uMap;
+      uniform float uTime;
+      varying vec3 vColor;
+      varying float vAlpha;
+
+      void main() {
+        if (vAlpha <= 0.01) discard;
+        vec2 centered = gl_PointCoord - vec2(0.5);
+        float radialDist = length(centered);
+        if (radialDist > 0.5) discard;
+
+        float coreGlow = pow(1.0 - radialDist * 2.0, 1.45);
+        vec4 texColor = texture2D(uMap, gl_PointCoord);
+        float finalAlpha = texColor.a * coreGlow * vAlpha;
+        if (finalAlpha <= 0.01) discard;
+
+        // Subtle hot white-gold center core with vibrant neon outer halo
+        vec3 hotCore = mix(vColor, vec3(1.8, 1.75, 1.6), pow(max(0.0, 1.0 - radialDist * 2.4), 2.5));
+        gl_FragColor = vec4(hotCore * finalAlpha, finalAlpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
+  });
+}
+
 // Pre-allocated module-scope math objects (Zero GC in render loop)
 const _playerFrame: TrackFrame = {
   position: new THREE.Vector3(),
@@ -223,6 +279,252 @@ const _desiredCamPos = new THREE.Vector3();
 const _desiredLookAt = new THREE.Vector3();
 const _smoothedCamPos = new THREE.Vector3();
 const _smoothedLookAt = new THREE.Vector3();
+
+// Pre-allocated Dynamic Time-of-Day Keyframes & Interpolation State (Zero GC in render loop)
+interface TimeOfDayKeyframe {
+  phase: number; // 0..1 normalized diurnal cycle
+  sunDir: THREE.Vector3;
+  sunColor: THREE.Color;
+  sunIntensity: number;
+  hemiSkyColor: THREE.Color;
+  hemiGroundColor: THREE.Color;
+  hemiIntensity: number;
+  rimColor: THREE.Color;
+  rimIntensity: number;
+  envIntensity: number;
+  fogColor: THREE.Color;
+  topColor: THREE.Color;
+  midColor: THREE.Color;
+  horizonColor: THREE.Color;
+  sunDiscColor: THREE.Color;
+  sunGlowColor: THREE.Color;
+  cloudTint: THREE.Color;
+  cloudOpacity: number;
+  starIntensity: number;
+  lampEmissiveIntensity: number;
+}
+
+const TIME_OF_DAY_KEYFRAMES: TimeOfDayKeyframe[] = [
+  // Stage 0 (0.00): Golden Afternoon (Higher sun, crisp angled shadows, warm daylight ambient)
+  {
+    phase: 0.0,
+    sunDir: new THREE.Vector3(-0.34, 0.38, -0.86).normalize(),
+    sunColor: new THREE.Color('#FFE0A3'),
+    sunIntensity: 1.78,
+    hemiSkyColor: new THREE.Color('#93C5FD'),
+    hemiGroundColor: new THREE.Color('#5C3A28'),
+    hemiIntensity: 0.78,
+    rimColor: new THREE.Color('#FDE68A'),
+    rimIntensity: 0.32,
+    envIntensity: 0.48,
+    fogColor: new THREE.Color('#D98A54'),
+    topColor: new THREE.Color('#132A4A'),
+    midColor: new THREE.Color('#3B6998'),
+    horizonColor: new THREE.Color('#F59E0B'),
+    sunDiscColor: new THREE.Color('#FFFBEB'),
+    sunGlowColor: new THREE.Color('#FB923C'),
+    cloudTint: new THREE.Color('#FDE68A'),
+    cloudOpacity: 0.38,
+    starIntensity: 0.0,
+    lampEmissiveIntensity: 0.65,
+  },
+  // Stage 1 (0.28): Radiant Canyon Sunset (Low sun, long dramatic sweeping shadows, crimson-orange sky)
+  {
+    phase: 0.28,
+    sunDir: new THREE.Vector3(-0.52, 0.135, -0.84).normalize(),
+    sunColor: new THREE.Color('#FF9E6D'),
+    sunIntensity: 1.65,
+    hemiSkyColor: new THREE.Color('#C084FC'),
+    hemiGroundColor: new THREE.Color('#33243B'),
+    hemiIntensity: 0.65,
+    rimColor: new THREE.Color('#FDBA74'),
+    rimIntensity: 0.28,
+    envIntensity: 0.42,
+    fogColor: new THREE.Color('#C85A48'),
+    topColor: new THREE.Color('#1A0B2E'),
+    midColor: new THREE.Color('#9D2B6B'),
+    horizonColor: new THREE.Color('#F97316'),
+    sunDiscColor: new THREE.Color('#FFF0E5'),
+    sunGlowColor: new THREE.Color('#FB7185'),
+    cloudTint: new THREE.Color('#FB923C'),
+    cloudOpacity: 0.35,
+    starIntensity: 0.14,
+    lampEmissiveIntensity: 1.65,
+  },
+  // Stage 2 (0.58): Deep Crimson Dusk / Twilight (Grazing horizon sun, elongated twilight shadows, emerging stars)
+  {
+    phase: 0.58,
+    sunDir: new THREE.Vector3(-0.74, 0.095, -0.66).normalize(),
+    sunColor: new THREE.Color('#FB7185'),
+    sunIntensity: 1.16,
+    hemiSkyColor: new THREE.Color('#818CF8'),
+    hemiGroundColor: new THREE.Color('#1E1B38'),
+    hemiIntensity: 0.52,
+    rimColor: new THREE.Color('#F472B6'),
+    rimIntensity: 0.24,
+    envIntensity: 0.34,
+    fogColor: new THREE.Color('#4C1D4B'),
+    topColor: new THREE.Color('#090618'),
+    midColor: new THREE.Color('#4A154B'),
+    horizonColor: new THREE.Color('#BE123C'),
+    sunDiscColor: new THREE.Color('#FECDD3'),
+    sunGlowColor: new THREE.Color('#E11D48'),
+    cloudTint: new THREE.Color('#9D174D'),
+    cloudOpacity: 0.25,
+    starIntensity: 0.65,
+    lampEmissiveIntensity: 2.25,
+  },
+  // Stage 3 (0.82): Starry Midnight / Moonlight (Elevated cool moonlight, crisp night shadows, bright track lamps)
+  {
+    phase: 0.82,
+    sunDir: new THREE.Vector3(0.42, 0.31, -0.85).normalize(),
+    sunColor: new THREE.Color('#7DD3FC'),
+    sunIntensity: 1.22,
+    hemiSkyColor: new THREE.Color('#38BDF8'),
+    hemiGroundColor: new THREE.Color('#090D16'),
+    hemiIntensity: 0.48,
+    rimColor: new THREE.Color('#38BDF8'),
+    rimIntensity: 0.25,
+    envIntensity: 0.3,
+    fogColor: new THREE.Color('#0B1325'),
+    topColor: new THREE.Color('#03050C'),
+    midColor: new THREE.Color('#091126'),
+    horizonColor: new THREE.Color('#0F1E38'),
+    sunDiscColor: new THREE.Color('#E0F2FE'),
+    sunGlowColor: new THREE.Color('#0284C7'),
+    cloudTint: new THREE.Color('#1E293B'),
+    cloudOpacity: 0.16,
+    starIntensity: 0.95,
+    lampEmissiveIntensity: 2.65,
+  },
+];
+
+const _todEnvState: TimeOfDayEnvironmentState = {
+  sunDir: new THREE.Vector3(-0.52, 0.135, -0.84).normalize(),
+  topColor: new THREE.Color(),
+  midColor: new THREE.Color(),
+  horizonColor: new THREE.Color(),
+  sunColor: new THREE.Color(),
+  sunGlowColor: new THREE.Color(),
+  cloudTint: new THREE.Color(),
+  cloudOpacity: 0.35,
+  starIntensity: 0,
+  lampEmissiveIntensity: 1.65,
+};
+const _todFogColor = new THREE.Color();
+
+function evaluateDynamicTimeOfDay(
+  theme: TrackTheme,
+  raceProgress: number,
+  sunLight: THREE.DirectionalLight,
+  hemiLight: THREE.HemisphereLight,
+  rimLight: THREE.DirectionalLight,
+  scene: THREE.Scene
+): { todEnv: TimeOfDayEnvironmentState; headlightsNeeded: boolean } {
+  // Starting phase anchor per track theme so each circuit begins in its signature lighting
+  // and progresses smoothly across the diurnal cycle as the race unfolds
+  const startPhase =
+    theme === 'canyon' ? 0.16 : theme === 'midnight' ? 0.68 : 0.0;
+  const cycleSpan = 0.72; // traverses ~72% of full diurnal cycle over a standard race
+  const phase = (((startPhase + raceProgress * cycleSpan) % 1.0) + 1.0) % 1.0;
+
+  const count = TIME_OF_DAY_KEYFRAMES.length;
+  for (let i = 0; i < count; i++) {
+    const curr = TIME_OF_DAY_KEYFRAMES[i];
+    const next = TIME_OF_DAY_KEYFRAMES[(i + 1) % count];
+    const nextPhase = i + 1 < count ? next.phase : next.phase + 1.0;
+    const checkPhase = phase < TIME_OF_DAY_KEYFRAMES[0].phase ? phase + 1.0 : phase;
+    if (checkPhase >= curr.phase && checkPhase <= nextPhase) {
+      const span = Math.max(0.0001, nextPhase - curr.phase);
+      const rawT = THREE.MathUtils.clamp((checkPhase - curr.phase) / span, 0, 1);
+      // Smoothstep for organic lighting transitions
+      const t = rawT * rawT * (3 - 2 * rawT);
+
+      _todEnvState.sunDir.lerpVectors(curr.sunDir, next.sunDir, t).normalize();
+      // Keep minimum vertical elevation >= 0.085 so directional shadow map projection never degenerates
+      if (_todEnvState.sunDir.y < 0.085) {
+        _todEnvState.sunDir.y = 0.085;
+        _todEnvState.sunDir.normalize();
+      }
+
+      sunLight.color.lerpColors(curr.sunColor, next.sunColor, t);
+      sunLight.intensity = THREE.MathUtils.lerp(
+        curr.sunIntensity,
+        next.sunIntensity,
+        t
+      );
+
+      hemiLight.color.lerpColors(curr.hemiSkyColor, next.hemiSkyColor, t);
+      hemiLight.groundColor.lerpColors(
+        curr.hemiGroundColor,
+        next.hemiGroundColor,
+        t
+      );
+      hemiLight.intensity = THREE.MathUtils.lerp(
+        curr.hemiIntensity,
+        next.hemiIntensity,
+        t
+      );
+
+      rimLight.color.lerpColors(curr.rimColor, next.rimColor, t);
+      rimLight.intensity = THREE.MathUtils.lerp(
+        curr.rimIntensity,
+        next.rimIntensity,
+        t
+      );
+
+      scene.environmentIntensity = THREE.MathUtils.lerp(
+        curr.envIntensity,
+        next.envIntensity,
+        t
+      );
+
+      _todFogColor.lerpColors(curr.fogColor, next.fogColor, t);
+      if (scene.fog instanceof THREE.FogExp2) {
+        scene.fog.color.copy(_todFogColor);
+      }
+      if (scene.background instanceof THREE.Color) {
+        scene.background.copy(_todFogColor);
+      }
+
+      _todEnvState.topColor.lerpColors(curr.topColor, next.topColor, t);
+      _todEnvState.midColor.lerpColors(curr.midColor, next.midColor, t);
+      _todEnvState.horizonColor.lerpColors(
+        curr.horizonColor,
+        next.horizonColor,
+        t
+      );
+      _todEnvState.sunColor.lerpColors(curr.sunDiscColor, next.sunDiscColor, t);
+      _todEnvState.sunGlowColor.lerpColors(
+        curr.sunGlowColor,
+        next.sunGlowColor,
+        t
+      );
+      _todEnvState.cloudTint.lerpColors(curr.cloudTint, next.cloudTint, t);
+      _todEnvState.cloudOpacity = THREE.MathUtils.lerp(
+        curr.cloudOpacity,
+        next.cloudOpacity,
+        t
+      );
+      _todEnvState.starIntensity = THREE.MathUtils.lerp(
+        curr.starIntensity,
+        next.starIntensity,
+        t
+      );
+      _todEnvState.lampEmissiveIntensity = THREE.MathUtils.lerp(
+        curr.lampEmissiveIntensity,
+        next.lampEmissiveIntensity,
+        t
+      );
+      break;
+    }
+  }
+
+  // Activate volumetric headlight cones during twilight/night or when track theme mandates it
+  const headlightsNeeded =
+    theme === 'midnight' || _todEnvState.starIntensity > 0.32;
+  return { todEnv: _todEnvState, headlightsNeeded };
+}
 
 /**
  * Shortest-arc angular damping (handles -PI..+PI wraparound seamlessly).
@@ -1321,6 +1623,389 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       }
     };
 
+    // 11. Pooled Multi-Color Finish Celebration Fireworks Particle System (World-Space, Zero-GC Pool)
+    const FIREWORK_PARTICLE_COUNT = 1080;
+    const fireworkGeo = new THREE.BufferGeometry();
+    const fireworkPositions = new Float32Array(FIREWORK_PARTICLE_COUNT * 3);
+    const fireworkVelocities = new Float32Array(FIREWORK_PARTICLE_COUNT * 3);
+    const fireworkColors = new Float32Array(FIREWORK_PARTICLE_COUNT * 3);
+    const fireworkAlphas = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkSizes = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkBaseSizes = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkLifetimes = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkMaxLifetimes = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkDrag = new Float32Array(FIREWORK_PARTICLE_COUNT);
+    const fireworkGravity = new Float32Array(FIREWORK_PARTICLE_COUNT);
+
+    for (let i = 0; i < FIREWORK_PARTICLE_COUNT; i++) {
+      fireworkPositions[i * 3 + 1] = -999;
+      fireworkAlphas[i] = 0;
+      fireworkSizes[i] = 0;
+      fireworkLifetimes[i] = 0;
+      fireworkMaxLifetimes[i] = 1;
+    }
+
+    fireworkGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(fireworkPositions, 3)
+    );
+    fireworkGeo.setAttribute(
+      'aColor',
+      new THREE.BufferAttribute(fireworkColors, 3)
+    );
+    fireworkGeo.setAttribute(
+      'aAlpha',
+      new THREE.BufferAttribute(fireworkAlphas, 1)
+    );
+    fireworkGeo.setAttribute(
+      'aSize',
+      new THREE.BufferAttribute(fireworkSizes, 1)
+    );
+
+    const fireworkMat = createFireworkParticleMaterial(softParticleSpriteTex);
+    const fireworkPoints = new THREE.Points(fireworkGeo, fireworkMat);
+    fireworkPoints.frustumCulled = false;
+    fireworkPoints.layers.enable(BLOOM_LAYER);
+    scene.add(fireworkPoints);
+
+    // Vibrant HDR-scaled color palettes for celebratory fireworks
+    const FIREWORK_PALETTES: [number, number, number][][] = [
+      // Neon Cyan & Electric Magenta
+      [
+        [0.0, 2.2, 1.95],
+        [2.3, 0.22, 1.15],
+        [1.9, 2.1, 2.4],
+      ],
+      // Golden Sunburst & Crimson Red
+      [
+        [2.4, 1.85, 0.25],
+        [2.35, 0.3, 0.22],
+        [2.5, 2.3, 1.4],
+      ],
+      // Emerald Lime & Sky Laser Blue
+      [
+        [1.1, 2.35, 0.35],
+        [0.25, 1.65, 2.45],
+        [2.1, 2.45, 1.8],
+      ],
+      // Royal Violet, Hot Pink & Gold
+      [
+        [1.55, 0.45, 2.45],
+        [2.4, 0.35, 1.45],
+        [2.45, 1.95, 0.4],
+      ],
+      // Vivid Tangerine, Turquoise & White-Gold
+      [
+        [2.45, 0.95, 0.15],
+        [0.15, 2.25, 1.85],
+        [2.4, 2.35, 2.0],
+      ],
+    ];
+
+    let fireworkCursor = 0;
+    const emitFireworkSpark = (
+      wx: number,
+      wy: number,
+      wz: number,
+      vx: number,
+      vy: number,
+      vz: number,
+      r: number,
+      g: number,
+      b: number,
+      baseSize: number,
+      life: number,
+      drag: number,
+      gravity: number
+    ) => {
+      const idx = fireworkCursor % FIREWORK_PARTICLE_COUNT;
+      fireworkCursor++;
+      fireworkPositions[idx * 3] = wx;
+      fireworkPositions[idx * 3 + 1] = wy;
+      fireworkPositions[idx * 3 + 2] = wz;
+      fireworkVelocities[idx * 3] = vx;
+      fireworkVelocities[idx * 3 + 1] = vy;
+      fireworkVelocities[idx * 3 + 2] = vz;
+      fireworkColors[idx * 3] = r;
+      fireworkColors[idx * 3 + 1] = g;
+      fireworkColors[idx * 3 + 2] = b;
+      fireworkAlphas[idx] = 1.0;
+      fireworkBaseSizes[idx] = baseSize;
+      fireworkSizes[idx] = baseSize;
+      fireworkLifetimes[idx] = life;
+      fireworkMaxLifetimes[idx] = life;
+      fireworkDrag[idx] = drag;
+      fireworkGravity[idx] = gravity;
+    };
+
+    const spawnFireworkAerialBurst = (
+      wx: number,
+      wy: number,
+      wz: number,
+      paletteIdx: number,
+      styleIdx: number
+    ) => {
+      const palette =
+        FIREWORK_PALETTES[paletteIdx % FIREWORK_PALETTES.length];
+      const primary = palette[0];
+      const secondary = palette[1];
+      const core = palette[2];
+
+      // Central flash core sparks
+      for (let c = 0; c < 12; c++) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        const spd = 2.5 + Math.random() * 4.5;
+        emitFireworkSpark(
+          wx,
+          wy,
+          wz,
+          Math.sin(phi) * Math.cos(theta) * spd,
+          Math.cos(phi) * spd,
+          Math.sin(phi) * Math.sin(theta) * spd,
+          core[0],
+          core[1],
+          core[2],
+          1.45,
+          0.55 + Math.random() * 0.25,
+          2.2,
+          3.5
+        );
+      }
+
+      if (styleIdx % 3 === 0) {
+        // Style 0: Spherical Peony + Inner Contrasting Starburst
+        const shellCount = 72;
+        for (let i = 0; i < shellCount; i++) {
+          const isInner = i < 24;
+          const col = isInner ? secondary : primary;
+          const u = Math.random();
+          const v = Math.random();
+          const theta = u * 2.0 * Math.PI;
+          const phi = Math.acos(2.0 * v - 1.0);
+          const speed = isInner
+            ? 11.0 + Math.random() * 4.5
+            : 19.5 + Math.random() * 6.5;
+          emitFireworkSpark(
+            wx,
+            wy,
+            wz,
+            Math.sin(phi) * Math.cos(theta) * speed,
+            Math.cos(phi) * speed,
+            Math.sin(phi) * Math.sin(theta) * speed,
+            col[0],
+            col[1],
+            col[2],
+            isInner ? 1.05 : 1.28,
+            1.35 + Math.random() * 0.55,
+            1.65,
+            6.8
+          );
+        }
+      } else if (styleIdx % 3 === 1) {
+        // Style 1: Double-Ring Saturn Halo + Vertical Crown
+        const ringCount = 44;
+        const tiltX = (Math.random() - 0.5) * 0.7;
+        const tiltZ = (Math.random() - 0.5) * 0.7;
+        const cosX = Math.cos(tiltX);
+        const sinX = Math.sin(tiltX);
+        const cosZ = Math.cos(tiltZ);
+        const sinZ = Math.sin(tiltZ);
+
+        for (let i = 0; i < ringCount; i++) {
+          const ang = (i / ringCount) * Math.PI * 2;
+          const ringSpd = 21.0 + (i % 2) * 3.5;
+          const rx = Math.cos(ang) * ringSpd;
+          const rz = Math.sin(ang) * ringSpd;
+          // Apply slight 3D ring tilt
+          const vx = rx * cosZ;
+          const vy = rx * sinZ * cosX + rz * sinX;
+          const vz = -rx * sinZ * sinX + rz * cosX;
+          const col = i % 2 === 0 ? primary : secondary;
+          emitFireworkSpark(
+            wx,
+            wy,
+            wz,
+            vx,
+            vy,
+            vz,
+            col[0],
+            col[1],
+            col[2],
+            1.32,
+            1.45 + Math.random() * 0.4,
+            1.75,
+            5.5
+          );
+        }
+        // Inner spherical burst
+        for (let i = 0; i < 32; i++) {
+          const theta = Math.random() * Math.PI * 2;
+          const phi = Math.acos(2 * Math.random() - 1);
+          const spd = 12.5 + Math.random() * 5.5;
+          emitFireworkSpark(
+            wx,
+            wy,
+            wz,
+            Math.sin(phi) * Math.cos(theta) * spd,
+            Math.cos(phi) * spd,
+            Math.sin(phi) * Math.sin(theta) * spd,
+            core[0],
+            core[1],
+            core[2],
+            1.1,
+            1.25 + Math.random() * 0.4,
+            1.8,
+            6.5
+          );
+        }
+      } else {
+        // Style 2: Cascading Chrysanthemum Willow Burst (long-hanging weeping trails)
+        const willowCount = 76;
+        for (let i = 0; i < willowCount; i++) {
+          const theta = Math.random() * Math.PI * 2;
+          const phi = Math.acos(2 * Math.random() - 1);
+          const spd = 15.0 + Math.random() * 9.5;
+          const col = i % 3 === 0 ? core : i % 2 === 0 ? primary : secondary;
+          emitFireworkSpark(
+            wx,
+            wy,
+            wz,
+            Math.sin(phi) * Math.cos(theta) * spd,
+            Math.cos(phi) * spd + 3.5,
+            Math.sin(phi) * Math.sin(theta) * spd,
+            col[0],
+            col[1],
+            col[2],
+            1.35,
+            1.75 + Math.random() * 0.65,
+            1.25,
+            9.8
+          );
+        }
+      }
+
+      ;(fireworkGeo.getAttribute('position') as THREE.BufferAttribute).needsUpdate =
+        true;
+      ;(fireworkGeo.getAttribute('aColor') as THREE.BufferAttribute).needsUpdate =
+        true;
+      ;(fireworkGeo.getAttribute('aAlpha') as THREE.BufferAttribute).needsUpdate =
+        true;
+      ;(fireworkGeo.getAttribute('aSize') as THREE.BufferAttribute).needsUpdate =
+        true;
+    };
+
+    // Pooled rising firework launch rockets that streak up from trackside before bursting
+    interface PooledFireworkRocket {
+      active: boolean;
+      x: number;
+      y: number;
+      z: number;
+      vx: number;
+      vy: number;
+      vz: number;
+      timer: number;
+      fuseDuration: number;
+      trailTimer: number;
+      paletteIdx: number;
+      styleIdx: number;
+    }
+    const FIREWORK_ROCKET_POOL_SIZE = 10;
+    const fireworkRocketPool: PooledFireworkRocket[] = [];
+    for (let i = 0; i < FIREWORK_ROCKET_POOL_SIZE; i++) {
+      fireworkRocketPool.push({
+        active: false,
+        x: 0,
+        y: -999,
+        z: 0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        timer: 0,
+        fuseDuration: 0.65,
+        trailTimer: 0,
+        paletteIdx: i,
+        styleIdx: i,
+      });
+    }
+    let fireworkRocketCursor = 0;
+    let finishCelebrationActive = false;
+    let finishFireworkSpawnTimer = 0;
+    let finishSalvoCount = 0;
+
+    const launchTracksideFirework = (
+      trackDist: number,
+      side: number,
+      latDist: number,
+      paletteIdx: number,
+      styleIdx: number,
+      instantBurst: boolean = false
+    ) => {
+      evaluateTrackFrame(trackDist, _camFrame);
+      const launchX =
+        _camFrame.position.x + _camFrame.right.x * (side * latDist);
+      const launchY = _camFrame.position.y + 0.5;
+      const launchZ =
+        _camFrame.position.z + _camFrame.right.z * (side * latDist);
+
+      if (instantBurst) {
+        const burstHeight = 19.0 + Math.random() * 14.0;
+        const inwardDrift = -side * (3.0 + Math.random() * 5.0);
+        spawnFireworkAerialBurst(
+          launchX + _camFrame.right.x * inwardDrift,
+          launchY + burstHeight,
+          launchZ + _camFrame.right.z * inwardDrift,
+          paletteIdx,
+          styleIdx
+        );
+        return;
+      }
+
+      const rkt =
+        fireworkRocketPool[fireworkRocketCursor % FIREWORK_ROCKET_POOL_SIZE];
+      fireworkRocketCursor++;
+      rkt.active = true;
+      rkt.x = launchX;
+      rkt.y = launchY;
+      rkt.z = launchZ;
+      // Angle slightly over the track so bursts frame the circuit sky
+      const inwardSpeed = -side * (4.5 + Math.random() * 5.5);
+      rkt.vx =
+        _camFrame.right.x * inwardSpeed + (Math.random() - 0.5) * 3.0;
+      rkt.vy = 32.0 + Math.random() * 12.0;
+      rkt.vz =
+        _camFrame.right.z * inwardSpeed + (Math.random() - 0.5) * 3.0;
+      rkt.timer = 0;
+      rkt.fuseDuration = 0.55 + Math.random() * 0.28;
+      rkt.trailTimer = 0;
+      rkt.paletteIdx = paletteIdx;
+      rkt.styleIdx = styleIdx;
+    };
+
+    const triggerFinishCelebrationSalvo = (baseTrackDist: number) => {
+      finishCelebrationActive = true;
+      finishFireworkSpawnTimer = 0.18;
+      finishSalvoCount = 0;
+
+      // Immediate opening sky bursts ahead of the player and over the Start/Finish gantry
+      for (let k = 0; k < 5; k++) {
+        const side = k % 2 === 0 ? 1 : -1;
+        const aheadOffset = 28 + k * 22;
+        const latDist = ROAD_HALF_WIDTH + 6.5 + (k % 3) * 3.0;
+        launchTracksideFirework(
+          baseTrackDist + aheadOffset,
+          side,
+          latDist,
+          k,
+          k,
+          k < 2 // first 2 detonate immediately in the sky, next 3 streak upward
+        );
+      }
+      // Also launch bursts around the Start/Finish gantry (s = 0)
+      launchTracksideFirework(0, -1, ROAD_HALF_WIDTH + 7.5, 1, 1, true);
+      launchTracksideFirework(18, 1, ROAD_HALF_WIDTH + 7.5, 3, 2, false);
+    };
+
     // Per-pair 0.3s collision cooldowns & overtake/corner tracking
     const collisionCooldowns: Record<string, number> = {};
     const rivalWasAhead: boolean[] = AI_DRIVERS.map(() => true);
@@ -1357,6 +2042,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       countdownTimer: 3.4,
       lastCountdownInt: 4,
       padBoostTimer: 0,
+      raceTimeElapsed: 0,
+      headlightsActiveState: initialConfig.headlightsActive,
       // Combat state
       hp: 100,
       maxHp: 100,
@@ -1434,6 +2121,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       playerState.countdownTimer = 3.2;
       playerState.lastCountdownInt = 4;
       playerState.padBoostTimer = 0;
+      playerState.raceTimeElapsed = 0;
 
       playerState.hp = 100;
       playerState.isDestroyed = false;
@@ -1472,6 +2160,21 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         pk.respawnTimer = 0;
         pk.group.visible = propsRef.current.combatMode;
       });
+      fireworkRocketPool.forEach((rkt) => {
+        rkt.active = false;
+      });
+      for (let i = 0; i < FIREWORK_PARTICLE_COUNT; i++) {
+        fireworkPositions[i * 3 + 1] = -999;
+        fireworkAlphas[i] = 0;
+        fireworkLifetimes[i] = 0;
+      }
+      ;(fireworkGeo.getAttribute('position') as THREE.BufferAttribute).needsUpdate =
+        true;
+      ;(fireworkGeo.getAttribute('aAlpha') as THREE.BufferAttribute).needsUpdate =
+        true;
+      finishCelebrationActive = false;
+      finishFireworkSpawnTimer = 0;
+      finishSalvoCount = 0;
 
       Object.keys(collisionCooldowns).forEach((k) => {
         collisionCooldowns[k] = 0;
@@ -2209,6 +2912,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
             playerState.currentLapTimeMs = 0;
 
             if (newLap > maxLaps) {
+              triggerFinishCelebrationSalvo(playerState.trackDistance);
               setStatus('finished');
             } else {
               playerState.lap = newLap;
@@ -3285,13 +3989,180 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         sparkPosAttr.needsUpdate = true;
       }
 
-      // Keep Sunset Directional Key Light aligned with the low sun in the sky shader (-0.52, 0.135, -0.84)
+      // 5. Update Finish-State Celebration Fireworks around the Track
+      if (currentStatus === 'finished') {
+        if (!finishCelebrationActive) {
+          triggerFinishCelebrationSalvo(playerState.trackDistance);
+        }
+        finishFireworkSpawnTimer -= dt;
+        if (finishFireworkSpawnTimer <= 0) {
+          finishFireworkSpawnTimer = 0.24 + Math.random() * 0.26;
+          finishSalvoCount++;
+
+          const side = finishSalvoCount % 2 === 0 ? 1 : -1;
+          const latDist = ROAD_HALF_WIDTH + 6.0 + Math.random() * 10.0;
+          // Alternate launching fireworks around the player's current view and around key track landmarks
+          const targetTrackDist =
+            finishSalvoCount % 4 === 0
+              ? (finishSalvoCount * 290) % TRACK_LENGTH
+              : playerState.trackDistance + 22 + Math.random() * 95;
+
+          launchTracksideFirework(
+            targetTrackDist,
+            side,
+            latDist,
+            finishSalvoCount + Math.floor(Math.random() * FIREWORK_PALETTES.length),
+            finishSalvoCount
+          );
+        }
+      }
+
+      // Update rising firework rockets & emit golden ascending spark trails
+      let fireworkParticlesDirty = false;
+      for (let i = 0; i < FIREWORK_ROCKET_POOL_SIZE; i++) {
+        const rkt = fireworkRocketPool[i];
+        if (!rkt.active) continue;
+        rkt.timer += dt;
+        rkt.x += rkt.vx * dt;
+        rkt.y += rkt.vy * dt;
+        rkt.z += rkt.vz * dt;
+        rkt.vy -= 9.8 * dt;
+
+        rkt.trailTimer += dt;
+        if (rkt.trailTimer >= 0.022) {
+          rkt.trailTimer = 0;
+          emitFireworkSpark(
+            rkt.x + (Math.random() - 0.5) * 0.25,
+            rkt.y,
+            rkt.z + (Math.random() - 0.5) * 0.25,
+            (Math.random() - 0.5) * 2.2,
+            -2.5 - Math.random() * 2.0,
+            (Math.random() - 0.5) * 2.2,
+            2.2,
+            1.75,
+            0.55,
+            0.78,
+            0.28 + Math.random() * 0.14,
+            2.0,
+            4.0
+          );
+          fireworkParticlesDirty = true;
+        }
+
+        if (rkt.timer >= rkt.fuseDuration) {
+          rkt.active = false;
+          spawnFireworkAerialBurst(
+            rkt.x,
+            rkt.y,
+            rkt.z,
+            rkt.paletteIdx,
+            rkt.styleIdx
+          );
+          fireworkParticlesDirty = true;
+        }
+      }
+
+      // Update active aerial firework burst particles (drag, gravity, shimmer & fade)
+      const fwPosAttr = fireworkGeo.getAttribute(
+        'position'
+      ) as THREE.BufferAttribute;
+      const fwAlphaAttr = fireworkGeo.getAttribute(
+        'aAlpha'
+      ) as THREE.BufferAttribute;
+      const fwSizeAttr = fireworkGeo.getAttribute(
+        'aSize'
+      ) as THREE.BufferAttribute;
+
+      for (let i = 0; i < FIREWORK_PARTICLE_COUNT; i++) {
+        const rem = fireworkLifetimes[i];
+        if (rem > 0) {
+          fireworkParticlesDirty = true;
+          const nextRem = rem - dt;
+          fireworkLifetimes[i] = nextRem;
+          if (nextRem <= 0) {
+            fireworkPositions[i * 3 + 1] = -999;
+            fireworkAlphas[i] = 0;
+            fireworkSizes[i] = 0;
+          } else {
+            const dragFactor = Math.max(0, 1.0 - fireworkDrag[i] * dt);
+            const vx = fireworkVelocities[i * 3] * dragFactor;
+            const vy =
+              (fireworkVelocities[i * 3 + 1] - fireworkGravity[i] * dt) *
+              dragFactor;
+            const vz = fireworkVelocities[i * 3 + 2] * dragFactor;
+            fireworkVelocities[i * 3] = vx;
+            fireworkVelocities[i * 3 + 1] = vy;
+            fireworkVelocities[i * 3 + 2] = vz;
+
+            fireworkPositions[i * 3] += vx * dt;
+            fireworkPositions[i * 3 + 1] += vy * dt;
+            fireworkPositions[i * 3 + 2] += vz * dt;
+
+            const lifeRatio = nextRem / Math.max(0.001, fireworkMaxLifetimes[i]);
+            // Twinkle effect in the final 45% of spark life
+            const twinkle =
+              lifeRatio < 0.45
+                ? 0.55 + 0.45 * Math.sin(elapsed * 42.0 + i * 3.7)
+                : 1.0;
+            fireworkAlphas[i] = Math.pow(lifeRatio, 0.75) * twinkle;
+            fireworkSizes[i] =
+              fireworkBaseSizes[i] * (0.45 + 0.65 * Math.sin(lifeRatio * Math.PI));
+          }
+        }
+      }
+
+      if (fireworkParticlesDirty) {
+        fwPosAttr.needsUpdate = true;
+        fwAlphaAttr.needsUpdate = true;
+        fwSizeAttr.needsUpdate = true;
+        fireworkMat.uniforms.uTime.value = elapsed;
+      }
+
+      // Dynamic Time-of-Day Progression: shifts sun angle, track shadows, ambient fill, fog & sky as the race progresses
+      if (currentStatus === 'racing' || currentStatus === 'finished') {
+        playerState.raceTimeElapsed += dt;
+      }
+      const totalRaceDist = Math.max(1, TRACK_LENGTH * maxLaps);
+      const distanceRatio = Math.max(0, playerState.trackDistance) / totalRaceDist;
+      const timeRatio = playerState.raceTimeElapsed / 135.0;
+      const raceProgress = distanceRatio * 0.68 + timeRatio * 0.32;
+
+      const { todEnv, headlightsNeeded } = evaluateDynamicTimeOfDay(
+        propsRef.current.trackTheme,
+        raceProgress,
+        sunLight,
+        hemiLight,
+        rimLight,
+        scene
+      );
+
+      // Update headlight cone visibility when crossing twilight/night threshold
+      if (playerState.headlightsActiveState !== headlightsNeeded) {
+        playerState.headlightsActiveState = headlightsNeeded;
+        playerRig.headlightCones.forEach((c) => {
+          c.visible = headlightsNeeded;
+        });
+        for (let i = 0; i < rivalRigs.length; i++) {
+          rivalRigs[i].headlightCones.forEach((c) => {
+            c.visible = headlightsNeeded;
+          });
+        }
+      }
+
+      // Position Directional Sun/Moon Light along dynamic celestial trajectory so shadows sweep & lengthen across the track
+      const sunDist = 200;
       sunLight.position.set(
-        _carWorldPos.x - 104,
-        _carWorldPos.y + 27,
-        _carWorldPos.z - 168
+        _carWorldPos.x + todEnv.sunDir.x * sunDist,
+        _carWorldPos.y + todEnv.sunDir.y * sunDist,
+        _carWorldPos.z + todEnv.sunDir.z * sunDist
       );
       sunLight.target.position.copy(_carWorldPos);
+      // Adapt shadow normalBias slightly at lower grazing sun angles to prevent shadow acne on banked asphalt
+      sunLight.shadow.normalBias = THREE.MathUtils.lerp(
+        0.032,
+        0.016,
+        THREE.MathUtils.clamp((todEnv.sunDir.y - 0.08) / 0.32, 0, 1)
+      );
 
       // Position gentle side-grazing rim light so it sculpts the body without reflecting into the chase camera off the roof or road
       rimLight.position.set(
@@ -3390,9 +4261,9 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
         camera.position.y += Math.cos(elapsed * 115) * amp * 0.7;
       }
 
-      // Update Sky Dome, Stars & Drifting Clouds
+      // Update Sky Dome, Stars, Mountain Haze, Lamps & Drifting Clouds with Dynamic Time-of-Day State
       if (activeTrack) {
-        activeTrack.updateEnvironment(elapsed, camera.position);
+        activeTrack.updateEnvironment(elapsed, camera.position, todEnv);
       }
 
       // Calculate Engine RPM & Gear (6-speed sequential + R/N)
@@ -3663,6 +4534,8 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       sparkMat.dispose();
       smokeGeo.dispose();
       smokeMat.dispose();
+      fireworkGeo.dispose();
+      fireworkMat.dispose();
       muzzleFlashGeo.dispose();
       muzzleFlashPool.forEach((mf) => mf.mat.dispose());
       tracerGeo.dispose();

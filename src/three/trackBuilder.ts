@@ -40,6 +40,19 @@ export interface BoostPadZone {
   mesh: THREE.Mesh;
 }
 
+export interface TimeOfDayEnvironmentState {
+  sunDir: THREE.Vector3;
+  topColor: THREE.Color;
+  midColor: THREE.Color;
+  horizonColor: THREE.Color;
+  sunColor: THREE.Color;
+  sunGlowColor: THREE.Color;
+  cloudTint: THREE.Color;
+  cloudOpacity: number;
+  starIntensity: number;
+  lampEmissiveIntensity: number;
+}
+
 export interface BuiltTrack {
   group: THREE.Group;
   asphaltTexture: THREE.CanvasTexture;
@@ -47,7 +60,11 @@ export interface BuiltTrack {
   gantryLights: THREE.MeshStandardMaterial[];
   propDebugGroup: THREE.Group;
   togglePropDebug: () => boolean;
-  updateEnvironment: (elapsed: number, cameraPos: THREE.Vector3) => void;
+  updateEnvironment: (
+    elapsed: number,
+    cameraPos: THREE.Vector3,
+    todState?: TimeOfDayEnvironmentState
+  ) => void;
   dispose: () => void;
 }
 
@@ -789,6 +806,9 @@ export function buildRacingTrack(
       uSunDir: {
         value: new THREE.Vector3(-0.52, 0.135, -0.84).normalize(),
       },
+      uStarIntensity: {
+        value: isMidnight ? 0.85 : 0.0,
+      },
       uTime: { value: 0 },
     },
     vertexShader: `
@@ -805,6 +825,7 @@ export function buildRacingTrack(
       uniform vec3 uSunColor;
       uniform vec3 uSunGlowColor;
       uniform vec3 uSunDir;
+      uniform float uStarIntensity;
       uniform float uTime;
       varying vec3 vWorldOffset;
 
@@ -812,14 +833,14 @@ export function buildRacingTrack(
         vec3 dir = normalize(vWorldOffset);
         float h = clamp(dir.y, 0.0, 1.0);
 
-        // Multi-stop sunset gradient: warm orange near horizon -> pink/magenta mid-sky -> deep purple zenith
+        // Multi-stop sky gradient: horizon -> mid-sky -> zenith
         vec3 sky = mix(uHorizonColor, uMidColor, smoothstep(0.0, 0.24, h));
         sky = mix(sky, uTopColor, smoothstep(0.20, 0.78, h));
 
         float horizonBloom = pow(1.0 - h, 4.8);
         sky += uSunGlowColor * horizonBloom * 0.16;
 
-        // Low sun with soft halo (clamped below bloom threshold so sky never blows out)
+        // Sun / Moon disc with soft atmospheric halo (clamped below bloom threshold so sky never blows out)
         float sunCos = max(dot(dir, uSunDir), 0.0);
         float wideHalo = pow(sunCos, 7.5) * 0.30;
         float coreHalo = pow(sunCos, 44.0) * 0.42;
@@ -828,6 +849,16 @@ export function buildRacingTrack(
         sky += uSunGlowColor * wideHalo;
         sky += mix(uSunGlowColor, uSunColor, 0.6) * coreHalo;
         sky = mix(sky, uSunColor * 0.92, sunDisc);
+
+        // Procedural high-altitude twinkling stars when dusk/night emerges
+        if (uStarIntensity > 0.01 && h > 0.12) {
+          vec3 starCell = floor(dir * 210.0);
+          float starHash = fract(sin(dot(starCell, vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+          float starSpark = smoothstep(0.9935, 0.9992, starHash);
+          float twinkle = 0.65 + 0.35 * sin(uTime * 2.8 + starHash * 62.8);
+          float zenithMask = smoothstep(0.14, 0.58, h) * (1.0 - smoothstep(0.985, 0.999, sunCos));
+          sky += vec3(0.86, 0.92, 1.0) * starSpark * twinkle * zenithMask * uStarIntensity * 0.75;
+        }
 
         float cloudBand = smoothstep(0.03, 0.18, h) * (1.0 - smoothstep(0.22, 0.52, h));
         float w1 = sin(dir.x * 11.0 + dir.z * 7.0 + uTime * 0.015);
@@ -855,6 +886,7 @@ export function buildRacingTrack(
 
   const cloudCount = 26;
   const sunDirNorm = new THREE.Vector3(-0.52, 0.135, -0.84).normalize();
+  const cloudMaterials: THREE.MeshBasicMaterial[] = [];
   for (let i = 0; i < cloudCount; i++) {
     const angle = (i / cloudCount) * Math.PI * 2 + (i % 3) * 0.08;
     const radius = 1750 + (i % 4) * 140;
@@ -882,6 +914,7 @@ export function buildRacingTrack(
       side: THREE.DoubleSide,
     });
     materialsToDispose.push(cloudMat);
+    cloudMaterials.push(cloudMat);
 
     const cloudMesh = new THREE.Mesh(cloudPlaneGeo, cloudMat);
     cloudMesh.position.set(cx, cy, cz);
@@ -930,6 +963,7 @@ export function buildRacingTrack(
     },
   ];
 
+  const ringMaterials: THREE.ShaderMaterial[] = [];
   horizonLayers.forEach((layer) => {
     const ringGeo = createCanyonHorizonRingGeometry(
       layer.radius,
@@ -945,7 +979,7 @@ export function buildRacingTrack(
         uBaseColor: { value: new THREE.Color(layer.baseHex) },
         uHazeColor: { value: new THREE.Color(layer.hazeHex) },
         uRimColor: { value: new THREE.Color(layer.rimHex) },
-        uSunDir: { value: sunDirNorm },
+        uSunDir: { value: sunDirNorm.clone() },
         uHazeStrength: { value: layer.hazeStrength },
       },
       vertexShader: `
@@ -988,6 +1022,7 @@ export function buildRacingTrack(
     skyDomeGroup.add(ringMesh);
     geometriesToDispose.push(ringGeo);
     materialsToDispose.push(ringMat);
+    ringMaterials.push(ringMat);
   });
 
   // ============================================================================
@@ -2312,6 +2347,273 @@ export function buildRacingTrack(
     });
   });
 
+  // F. Roadside Cheering Spectators (Both Hands Raised Above & Waving Different Colored Glowing Lights)
+  const spectatorPlacements: { s: number; side: number; latDist: number; phase: number; speed: number }[] = [];
+  const fanZones = [
+    { start: 18, end: 235, step: 9, sides: [-1, 1] },
+    { start: 270, end: 465, step: 11, sides: [-1, 1] },
+    { start: 560, end: 750, step: 12, sides: [1, -1] },
+    { start: 830, end: 1030, step: 11, sides: [-1, 1] },
+    { start: 1120, end: 1350, step: 11, sides: [-1, 1] },
+    { start: 1490, end: 1710, step: 12, sides: [1, -1] },
+    { start: 1850, end: 2140, step: 11, sides: [-1, 1] },
+    { start: 2260, end: 2390, step: 9, sides: [-1, 1] },
+  ];
+
+  let specSeed = 1337;
+  const nextSpecRand = () => {
+    specSeed = (specSeed * 1664525 + 1013904223) % 4294967296;
+    return specSeed / 4294967296;
+  };
+
+  for (const zone of fanZones) {
+    for (let s = zone.start; s <= zone.end; s += zone.step) {
+      for (const side of zone.sides) {
+        // Place spectators in small lively clusters just behind the roadside guardrail
+        const jitterS = (nextSpecRand() - 0.5) * 3.2;
+        const rowOffset = (nextSpecRand() * 1.45);
+        const latDist = MIN_SAFE_PROP_OFFSET + 1.38 + rowOffset;
+        spectatorPlacements.push({
+          s: (s + jitterS + TRACK_LENGTH) % TRACK_LENGTH,
+          side,
+          latDist,
+          phase: nextSpecRand() * Math.PI * 2,
+          speed: 4.8 + nextSpecRand() * 3.4,
+        });
+      }
+    }
+  }
+
+  const spectatorCount = spectatorPlacements.length;
+
+  // Lower body / legs (pivot at ground y = 0)
+  const specLegsGeo = new THREE.BoxGeometry(0.42, 0.86, 0.26);
+  specLegsGeo.translate(0, 0.43, 0);
+  const specLegsMat = new THREE.MeshStandardMaterial({
+    color: 0x1e293b,
+    roughness: 0.85,
+  });
+
+  // Torso (pivot at ground y = 0, sits at y = 0.84..1.58)
+  const specTorsoGeo = new THREE.BoxGeometry(0.52, 0.74, 0.30);
+  specTorsoGeo.translate(0, 1.21, 0);
+  const specTorsoMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.65,
+  });
+
+  // Head (pivot at ground y = 0, sits at y = 1.76)
+  const specHeadGeo = new THREE.SphereGeometry(0.18, 10, 10);
+  specHeadGeo.translate(0, 1.77, 0);
+  const specHeadMat = new THREE.MeshStandardMaterial({
+    color: 0xf1c27d,
+    roughness: 0.6,
+  });
+
+  // Raised Arm Geometry: pivot at shoulder (0, 0, 0), extends upward (+Y) so both hands are raised above head
+  const specArmGeo = new THREE.CylinderGeometry(0.068, 0.078, 0.66, 8);
+  specArmGeo.translate(0, 0.33, 0);
+  const specArmMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.65,
+  });
+
+  // Handheld Glowing Lightstick Geometry: attached to the raised hand at top of arm (y = 0.62..1.22 from shoulder)
+  const specLightGeo = new THREE.CylinderGeometry(0.062, 0.048, 0.62, 8);
+  specLightGeo.translate(0, 0.90, 0);
+  // Unlit / HDR-like Basic material with per-instance neon color + selective bloom layer
+  const specLightMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    toneMapped: false,
+  });
+
+  const specLegsInst = new THREE.InstancedMesh(specLegsGeo, specLegsMat, spectatorCount);
+  const specTorsoInst = new THREE.InstancedMesh(specTorsoGeo, specTorsoMat, spectatorCount);
+  const specHeadInst = new THREE.InstancedMesh(specHeadGeo, specHeadMat, spectatorCount);
+  const specLeftArmInst = new THREE.InstancedMesh(specArmGeo, specArmMat, spectatorCount);
+  const specRightArmInst = new THREE.InstancedMesh(specArmGeo, specArmMat, spectatorCount);
+  const specLeftLightInst = new THREE.InstancedMesh(specLightGeo, specLightMat, spectatorCount);
+  const specRightLightInst = new THREE.InstancedMesh(specLightGeo, specLightMat, spectatorCount);
+
+  specLeftLightInst.layers.enable(TRACK_BLOOM_LAYER);
+  specRightLightInst.layers.enable(TRACK_BLOOM_LAYER);
+
+  geometriesToDispose.push(specLegsGeo, specTorsoGeo, specHeadGeo, specArmGeo, specLightGeo);
+  materialsToDispose.push(specLegsMat, specTorsoMat, specHeadMat, specArmMat, specLightMat);
+
+  const jacketPalette = [
+    new THREE.Color(0xe11d48),
+    new THREE.Color(0x2563eb),
+    new THREE.Color(0x0d9488),
+    new THREE.Color(0xd97706),
+    new THREE.Color(0x7c3aed),
+    new THREE.Color(0x475569),
+    new THREE.Color(0xe2e8f0),
+  ];
+
+  // High-intensity neon colors for handheld cheering lights (multiplied > 1.0 so they trigger selective bloom)
+  const neonLightPalette = [
+    new THREE.Color(0x00f5d4).multiplyScalar(2.2), // Neon Cyan
+    new THREE.Color(0xff2a85).multiplyScalar(2.2), // Hot Magenta
+    new THREE.Color(0xa3e635).multiplyScalar(2.2), // Electric Lime
+    new THREE.Color(0xff7b00).multiplyScalar(2.2), // Vivid Orange
+    new THREE.Color(0xa855f7).multiplyScalar(2.2), // Neon Violet
+    new THREE.Color(0xfacc15).multiplyScalar(2.2), // Laser Yellow
+    new THREE.Color(0x38bdf8).multiplyScalar(2.2), // Sky Laser Blue
+    new THREE.Color(0xff3b30).multiplyScalar(2.2), // Neon Coral Red
+  ];
+
+  const specBasePos = new Array<THREE.Vector3>(spectatorCount);
+  const specBaseQuat = new Array<THREE.Quaternion>(spectatorCount);
+
+  for (let i = 0; i < spectatorCount; i++) {
+    const info = spectatorPlacements[i];
+    const yawJitter = (nextSpecRand() - 0.5) * 0.25;
+    instScale.set(1, 1, 1);
+
+    computeValidatedPropPlacement(
+      info.s,
+      info.side,
+      info.latDist,
+      0.35,
+      yawJitter,
+      0,
+      trackSamples,
+      frame,
+      normalXZ,
+      instPos,
+      instQuat
+    );
+
+    specBasePos[i] = instPos.clone();
+    specBaseQuat[i] = instQuat.clone();
+
+    instMatrix.compose(instPos, instQuat, instScale);
+    specLegsInst.setMatrixAt(i, instMatrix);
+    specTorsoInst.setMatrixAt(i, instMatrix);
+    specHeadInst.setMatrixAt(i, instMatrix);
+    specLeftArmInst.setMatrixAt(i, instMatrix);
+    specRightArmInst.setMatrixAt(i, instMatrix);
+    specLeftLightInst.setMatrixAt(i, instMatrix);
+    specRightLightInst.setMatrixAt(i, instMatrix);
+
+    const jacketCol = jacketPalette[i % jacketPalette.length];
+    specTorsoInst.setColorAt(i, jacketCol);
+    specLeftArmInst.setColorAt(i, jacketCol);
+    specRightArmInst.setColorAt(i, jacketCol);
+
+    // Ensure left and right hands hold DIFFERENT colored glowing lights
+    const leftColorIdx = Math.floor(nextSpecRand() * neonLightPalette.length);
+    const rightColorIdx =
+      (leftColorIdx + 1 + Math.floor(nextSpecRand() * (neonLightPalette.length - 1))) %
+      neonLightPalette.length;
+
+    specLeftLightInst.setColorAt(i, neonLightPalette[leftColorIdx]);
+    specRightLightInst.setColorAt(i, neonLightPalette[rightColorIdx]);
+  }
+
+  specLegsInst.instanceMatrix.needsUpdate = true;
+  specTorsoInst.instanceMatrix.needsUpdate = true;
+  specHeadInst.instanceMatrix.needsUpdate = true;
+  specLeftArmInst.instanceMatrix.needsUpdate = true;
+  specRightArmInst.instanceMatrix.needsUpdate = true;
+  specLeftLightInst.instanceMatrix.needsUpdate = true;
+  specRightLightInst.instanceMatrix.needsUpdate = true;
+  if (specTorsoInst.instanceColor) specTorsoInst.instanceColor.needsUpdate = true;
+  if (specLeftArmInst.instanceColor) specLeftArmInst.instanceColor.needsUpdate = true;
+  if (specRightArmInst.instanceColor) specRightArmInst.instanceColor.needsUpdate = true;
+  if (specLeftLightInst.instanceColor) specLeftLightInst.instanceColor.needsUpdate = true;
+  if (specRightLightInst.instanceColor) specRightLightInst.instanceColor.needsUpdate = true;
+
+  specLegsInst.computeBoundingSphere();
+  specTorsoInst.computeBoundingSphere();
+  specHeadInst.computeBoundingSphere();
+  specLeftArmInst.computeBoundingSphere();
+  specRightArmInst.computeBoundingSphere();
+  specLeftLightInst.computeBoundingSphere();
+  specRightLightInst.computeBoundingSphere();
+
+  group.add(
+    specLegsInst,
+    specTorsoInst,
+    specHeadInst,
+    specLeftArmInst,
+    specRightArmInst,
+    specLeftLightInst,
+    specRightLightInst
+  );
+
+  registeredProps.push({
+    kind: 'instanced',
+    name: 'RoadsideCheeringSpectators',
+    mesh: specLegsInst,
+    companionMesh: specTorsoInst,
+    count: spectatorCount,
+    inwardRadius: 0.35,
+    allowTilt: false,
+    groundYOffset: 0,
+    localBoxSize: new THREE.Vector3(0.7, 2.6, 0.5),
+  });
+
+  // Pre-allocated scratch objects for zero-GC per-frame spectator cheering animation
+  const animBodyPos = new THREE.Vector3();
+  const animShoulderOffset = new THREE.Vector3();
+  const animShoulderWorldPos = new THREE.Vector3();
+  const animArmLocalEuler = new THREE.Euler(0, 0, 0, 'XYZ');
+  const animArmLocalQuat = new THREE.Quaternion();
+  const animArmWorldQuat = new THREE.Quaternion();
+  const animUnitScale = new THREE.Vector3(1, 1, 1);
+  const animMatrix = new THREE.Matrix4();
+
+  const updateCheeringSpectators = (elapsed: number) => {
+    for (let i = 0; i < spectatorCount; i++) {
+      const info = spectatorPlacements[i];
+      const baseP = specBasePos[i];
+      const baseQ = specBaseQuat[i];
+      const t = elapsed * info.speed + info.phase;
+
+      // Subtle excited vertical cheer bounce for upper body & head
+      const bounceY = Math.abs(Math.sin(t)) * 0.11;
+      animBodyPos.set(baseP.x, baseP.y + bounceY, baseP.z);
+      animMatrix.compose(animBodyPos, baseQ, animUnitScale);
+      specTorsoInst.setMatrixAt(i, animMatrix);
+      specHeadInst.setMatrixAt(i, animMatrix);
+
+      // Left arm raised above head (+Y) & waving side-to-side and forward/back
+      const leftWaveZ = 0.28 + Math.sin(t) * 0.42; // Raised V-angle outward/inward
+      const leftWaveX = -0.18 + Math.cos(t * 0.85) * 0.32; // Forward/backward cheer wave
+      animShoulderOffset.set(-0.29, 1.50 + bounceY, 0.04).applyQuaternion(baseQ);
+      animShoulderWorldPos.copy(baseP).add(animShoulderOffset);
+      animArmLocalEuler.set(leftWaveX, 0, leftWaveZ);
+      animArmLocalQuat.setFromEuler(animArmLocalEuler);
+      animArmWorldQuat.copy(baseQ).multiply(animArmLocalQuat);
+      animMatrix.compose(animShoulderWorldPos, animArmWorldQuat, animUnitScale);
+      specLeftArmInst.setMatrixAt(i, animMatrix);
+      specLeftLightInst.setMatrixAt(i, animMatrix);
+
+      // Right arm raised above head (+Y) & waving with opposite/sync rhythm
+      const rightWaveZ = -0.28 + Math.sin(t + 0.65) * 0.42;
+      const rightWaveX = -0.18 - Math.cos(t * 0.85 + 0.4) * 0.32;
+      animShoulderOffset.set(0.29, 1.50 + bounceY, 0.04).applyQuaternion(baseQ);
+      animShoulderWorldPos.copy(baseP).add(animShoulderOffset);
+      animArmLocalEuler.set(rightWaveX, 0, rightWaveZ);
+      animArmLocalQuat.setFromEuler(animArmLocalEuler);
+      animArmWorldQuat.copy(baseQ).multiply(animArmLocalQuat);
+      animMatrix.compose(animShoulderWorldPos, animArmWorldQuat, animUnitScale);
+      specRightArmInst.setMatrixAt(i, animMatrix);
+      specRightLightInst.setMatrixAt(i, animMatrix);
+    }
+
+    specTorsoInst.instanceMatrix.needsUpdate = true;
+    specHeadInst.instanceMatrix.needsUpdate = true;
+    specLeftArmInst.instanceMatrix.needsUpdate = true;
+    specRightArmInst.instanceMatrix.needsUpdate = true;
+    specLeftLightInst.instanceMatrix.needsUpdate = true;
+    specRightLightInst.instanceMatrix.needsUpdate = true;
+  };
+  // Initialize spectator arm poses immediately at t = 0
+  updateCheeringSpectators(0);
+
   // ============================================================================
   // 7. START/FINISH LINE, OVERHEAD GANTRIES, BOOST PADS & GUARDRAIL POSTS
   // ============================================================================
@@ -2518,13 +2820,51 @@ export function buildRacingTrack(
     return propDebugGroup.visible;
   };
 
-  const updateEnvironment = (elapsed: number, cameraPos: THREE.Vector3) => {
+  const updateEnvironment = (
+    elapsed: number,
+    cameraPos: THREE.Vector3,
+    todState?: TimeOfDayEnvironmentState
+  ) => {
     // Keep sky dome centered on camera for infinite horizon feel
     skyDomeGroup.position.x = cameraPos.x;
     skyDomeGroup.position.z = cameraPos.z;
     skyMat.uniforms.uTime.value = elapsed;
+
+    if (todState) {
+      skyMat.uniforms.uSunDir.value.copy(todState.sunDir);
+      skyMat.uniforms.uTopColor.value.copy(todState.topColor);
+      skyMat.uniforms.uMidColor.value.copy(todState.midColor);
+      skyMat.uniforms.uHorizonColor.value.copy(todState.horizonColor);
+      skyMat.uniforms.uSunColor.value.copy(todState.sunColor);
+      skyMat.uniforms.uSunGlowColor.value.copy(todState.sunGlowColor);
+      skyMat.uniforms.uStarIntensity.value = todState.starIntensity;
+
+      for (let i = 0; i < ringMaterials.length; i++) {
+        const rMat = ringMaterials[i];
+        rMat.uniforms.uSunDir.value.copy(todState.sunDir);
+        const layerFactor = 0.28 + i * 0.16;
+        rMat.uniforms.uBaseColor.value
+          .copy(todState.topColor)
+          .lerp(todState.midColor, 0.45 - i * 0.12)
+          .multiplyScalar(0.85);
+        rMat.uniforms.uHazeColor.value
+          .copy(todState.horizonColor)
+          .lerp(todState.midColor, layerFactor);
+        rMat.uniforms.uRimColor.value.copy(todState.sunGlowColor);
+      }
+
+      for (let i = 0; i < cloudMaterials.length; i++) {
+        cloudMaterials[i].color.copy(todState.cloudTint);
+        cloudMaterials[i].opacity = todState.cloudOpacity;
+      }
+
+      poleLampMat.emissiveIntensity = todState.lampEmissiveIntensity;
+    }
+
     // Slowly drift stylized clouds
     cloudGroup.rotation.y = elapsed * 0.0085;
+    // Animate roadside cheering spectators waving both raised hands & glowing lightsticks
+    updateCheeringSpectators(elapsed);
   };
 
   const dispose = () => {
