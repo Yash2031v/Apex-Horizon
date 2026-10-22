@@ -183,7 +183,7 @@ export default function App() {
   const [trackTheme, setTrackTheme] = useState<TrackTheme>('canyon');
   const [livery, setLivery] = useState<CarLivery>(CAR_LIVERIES[0]);
   const [cameraMode, setCameraMode] = useState<CameraMode>('chase');
-  const [raceStatus, setRaceStatus] = useState<RaceStatus>('ready');
+  const [raceStatus, setRaceStatus] = useState<RaceStatus>('countdown');
   const [combatMode, setCombatMode] = useState<boolean>(true);
   const [combatDifficulty, setCombatDifficulty] =
     useState<CombatDifficulty>('normal');
@@ -193,7 +193,7 @@ export default function App() {
   const [resetSignal, setResetSignal] = useState<number>(0);
   const [telemetry, setTelemetry] = useState<RaceTelemetry>(INITIAL_TELEMETRY);
 
-  const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(false);
+  const [isDockCollapsed, setIsDockCollapsed] = useState<boolean>(true);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [masterVolume, setMasterVolume] = useState<number>(0.75);
   const [activeModal, setActiveModal] = useState<
