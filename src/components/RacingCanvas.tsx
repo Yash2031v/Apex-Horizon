@@ -2463,7 +2463,7 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
     const pushKillFeed = (message: string, isPlayerKill: boolean) => {
       playerState.killFeed = [
         {
-          id: `${Date.now()}_${Math.random()}`,
+          id: crypto.randomUUID(),
           message,
           timestamp: performance.now(),
           isPlayerKill,
