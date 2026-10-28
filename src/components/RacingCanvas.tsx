@@ -692,7 +692,7 @@ const AI_DRIVERS = [
   { id: 'ai-5', name: 'E. Vance', code: 'VAN', liveryIdx: 5, baseSpeed: 68.8 },
 ];
 
-export const RacingCanvas: React.FC<RacingCanvasProps> = ({
+export const RacingCanvas: React.FC<RacingCanvasProps> = React.memo(({
   trackTheme,
   livery,
   cameraMode,
@@ -5360,4 +5360,4 @@ export const RacingCanvas: React.FC<RacingCanvasProps> = ({
       )}
     </div>
   );
-};
+});

@@ -1,0 +1,3 @@
+## 2026-10-28 - [Memoizing High-Frequency Components]
+**Learning:** High-frequency state updates in a parent component (like 20Hz telemetry ticks in `App`) will unnecessarily re-render all child components if they aren't memoized. Components like `RacingCanvas` (which manages heavy WebGL state) and complex UI elements (like SVG `PixelHeartRow`) should be wrapped in `React.memo()` to prevent executing their render functions on every tick when their props haven't actually changed.
+**Action:** Always check the update frequency of parent components. If a parent re-renders rapidly due to state that only affects specific parts of the UI, use `React.memo()` on stable child components to prevent cascading renders.

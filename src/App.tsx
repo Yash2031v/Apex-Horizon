@@ -104,7 +104,7 @@ const PIXEL_HEART_SVG_ROWS = [
   '00011000',
 ];
 
-function PixelHeartIcon({
+const PixelHeartIcon = React.memo(function PixelHeartIcon({
   state,
   size = 12,
 }: {
@@ -146,9 +146,9 @@ function PixelHeartIcon({
       )}
     </svg>
   );
-}
+});
 
-function PixelHeartRow({
+const PixelHeartRow = React.memo(function PixelHeartRow({
   hp,
   prevHp,
   isFlashing,
@@ -177,7 +177,7 @@ function PixelHeartRow({
       })}
     </div>
   );
-}
+});
 
 export default function App() {
   const [trackTheme, setTrackTheme] = useState<TrackTheme>('canyon');
